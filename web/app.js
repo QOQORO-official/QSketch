@@ -101,6 +101,7 @@ function defaultSettings() {
     curve: 0,              // -1 soft .. +1 firm  (gamma = 3^curve)
     fingers: 'auto',       // 'auto' | 'draw' | 'navigate'
     penButtonErase: true,  // S Pen / stylus barrel button = eraser
+    lowLatency: false,     // desynchronized canvas: less ink delay, may flicker on some phones
     page: { pattern: 'dots', spacing: 24, paper: 'auto' },   // last used page style
   };
 }
@@ -131,7 +132,7 @@ function loadSettings() {
     if (raw) {
       const saved = JSON.parse(raw);
       const old = (saved.schema || 2) < SETTINGS_SCHEMA;
-      for (const k of ['brush', 'eraserSize', 'pressure', 'curve', 'fingers', 'penButtonErase'])
+      for (const k of ['brush', 'eraserSize', 'pressure', 'curve', 'fingers', 'penButtonErase', 'lowLatency'])
         if (saved[k] !== undefined) s[k] = saved[k];
       if (saved.page) Object.assign(s.page, saved.page);
       for (const b of BRUSHES) {
@@ -185,8 +186,36 @@ let color = '#1b1d23';
 let dpr = Math.max(1, window.devicePixelRatio || 1);
 let penSeen = false;               // a stylus has been used on this page
 
-const canvas = document.getElementById('canvas');
-const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+let canvas = document.getElementById('canvas');
+// Low-latency ink is opt-in (Brush settings). `desynchronized: true` lets
+// Chrome hand the canvas buffer straight to the display controller, skipping
+// the compositor: less pen delay, but on some phones (seen on Samsung) the
+// display then scans out half-painted frames during full redraws such as
+// pinch-zoom -- green flashes that screen recordings, which capture the
+// composited output, never show. The default path is vsync'd and
+// double-buffered, for about one frame of extra latency.
+let ctx = canvas.getContext('2d', { alpha: false, desynchronized: !!settings.lowLatency });
+
+// Context attributes are fixed once created, so switching modes swaps in a
+// fresh canvas element; its event handlers are re-attached from this list.
+const canvasHandlers = [];
+function onCanvas(type, fn, opts) {
+  canvasHandlers.push([type, fn, opts]);
+  canvas.addEventListener(type, fn, opts);
+}
+function lowLatencyActive() {
+  return !!(ctx.getContextAttributes && ctx.getContextAttributes().desynchronized);
+}
+function setLowLatency(on) {
+  if (lowLatencyActive() === !!on) return;
+  const fresh = canvas.cloneNode(false);           // same id, classes, styles
+  for (const [type, fn, opts] of canvasHandlers) fresh.addEventListener(type, fn, opts);
+  canvas.replaceWith(fresh);
+  canvas = fresh;
+  ctx = canvas.getContext('2d', { alpha: false, desynchronized: !!on });
+  resize();                                        // size the new buffer, repaint
+  setCursor();
+}
 
 // committed strokes are rendered into this cached layer
 const layer = document.createElement('canvas');
@@ -844,7 +873,7 @@ function touchUp(ev) {
 // -------------------------------------------------------------------------
 // pointer routing
 // -------------------------------------------------------------------------
-canvas.addEventListener('pointerdown', (ev) => {
+onCanvas('pointerdown', (ev) => {
   hideHint();
   closePanel();
   closeBrushMenu();
@@ -870,7 +899,7 @@ canvas.addEventListener('pointerdown', (ev) => {
   beginStroke(ev, tool === 'eraser' || penErase);
 });
 
-canvas.addEventListener('pointermove', (ev) => {
+onCanvas('pointermove', (ev) => {
   if (ev.pointerType === 'touch') { touchMove(ev); return; }
   if (ev.pointerType === 'pen') { markPen(); if (!stroke) showPressure(ev.pressure); }
   if (mousePan && mousePan.id === ev.pointerId) {
@@ -893,16 +922,16 @@ function pointerEnd(ev) {
   }
   if (stroke && stroke.id === ev.pointerId) endStroke();
 }
-canvas.addEventListener('pointerup', pointerEnd);
-canvas.addEventListener('pointercancel', pointerEnd);
-canvas.addEventListener('lostpointercapture', (ev) => {
+onCanvas('pointerup', pointerEnd);
+onCanvas('pointercancel', pointerEnd);
+onCanvas('lostpointercapture', (ev) => {
   if (stroke && stroke.id === ev.pointerId && ev.pointerType !== 'touch') endStroke();
 });
 // S Pen side-button clicks and long-presses must not open a context menu.
-canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
+onCanvas('contextmenu', (ev) => ev.preventDefault());
 
 // wheel: zoom toward cursor (ctrl+wheel = trackpad pinch); shift+wheel pans
-canvas.addEventListener('wheel', (ev) => {
+onCanvas('wheel', (ev) => {
   ev.preventDefault();
   const p = localXY(ev);
   if (ev.shiftKey && !ev.ctrlKey) {
@@ -1282,7 +1311,16 @@ function bindCheck(id, key) {
   el.addEventListener('change', () => { settings[key] = el.checked; saveSettings(); syncPressureUI(); });
   return () => { el.checked = !!settings[key]; };
 }
-refreshers.push(bindCheck('pressureOn', 'pressure'), bindCheck('penButtonErase', 'penButtonErase'));
+refreshers.push(bindCheck('pressureOn', 'pressure'), bindCheck('penButtonErase', 'penButtonErase'),
+                bindCheck('lowLatency', 'lowLatency'));
+$('lowLatency').addEventListener('change', () => { setLowLatency(settings.lowLatency); syncLowLatencyNote(); });
+function syncLowLatencyNote() {
+  const note = $('lowLatencyNote');
+  if (settings.lowLatency && !lowLatencyActive()) note.textContent = 'This browser does not support low-latency canvases, so it has no effect here.';
+  else note.textContent = settings.lowLatency
+    ? 'On: ink appears a little sooner. Turn it off if you see flicker or green flashes while zooming.'
+    : 'Off: every frame goes through the browser compositor (smoothest, no flicker).';
+}
 $('fingers').value = settings.fingers;
 $('fingers').addEventListener('change', (e) => { settings.fingers = e.target.value; saveSettings(); updateFingerNote(); });
 refreshers.push(() => { $('fingers').value = settings.fingers; });
@@ -1294,6 +1332,7 @@ $('resetBrush').addEventListener('click', () => {
   saveSettings();
   syncBrushUI();
   syncPressureUI(); updateFingerNote();
+  setLowLatency(settings.lowLatency); syncLowLatencyNote();
 });
 
 function syncPressureUI() {
@@ -1492,6 +1531,7 @@ async function boot() {
   syncUndo();
   syncPressureUI();
   updateFingerNote();
+  syncLowLatencyNote();
   $('loading').classList.add('hidden');
   requestAnimationFrame(frame);
   hintTimer = setTimeout(hideHint, 8000);

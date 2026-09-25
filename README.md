@@ -77,6 +77,11 @@ here reduced to a single command-line pipeline instead of an in-browser IDE.
 - **Tools**: pen, stroke eraser with its own size (one drag = one undo step), lasso, pan.
 - **Undo / redo**, **Save / open** (`.qsketch` stores each stroke's tip, brush
   settings and the page style; older files still open), **Export PNG**.
+- **Display-safe rendering by default**: drawing goes through the browser's
+  normal, vsync'd compositor. An optional *Low-latency ink* switch (Brush ⚙)
+  uses a desynchronized canvas for slightly quicker ink on devices that handle
+  it; it's off by default because some phones (seen on Samsung) show green
+  flashes with it while zooming.
 - **No runtime dependencies**: one HTML file, one JS file, one CSS file and one
   self-contained `.wasm` with zero imports. Light/dark aware; settings are
   remembered per browser.
