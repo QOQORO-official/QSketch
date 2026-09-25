@@ -20,7 +20,7 @@ an endless canvas — and delivers them as a page you can open anywhere.
 
 The performance-critical core (stroke smoothing, variable-width tessellation,
 spatial hit-testing, undo history, serialization) is written in Nim and
-cross-compiled to a ~20 KB `wasm32` module. The build approach — driving Nim
+cross-compiled to a ~25 KB `wasm32` module. The build approach — driving Nim
 through `clang`/`wasm-ld` to a freestanding WebAssembly binary with a tiny libc
 shim — is inspired by
 [**bindweb-nim-WASM-compiler**](https://github.com/benagastov/bindweb-nim-WASM-compiler),
@@ -28,20 +28,30 @@ here reduced to a single command-line pipeline instead of an in-browser IDE.
 
 ### Features
 
-- **Pressure-sensitive brush** — real stylus pressure (via Pointer Events) drives
-  variable stroke width; strokes are Catmull-Rom smoothed and rendered as filled
-  vector outlines with rounded caps.
-- **Infinite canvas** — pan (Space+drag / middle-drag) and zoom-to-cursor
-  (scroll / pinch) implemented as a pure Canvas2D transform, so the engine never
-  re-runs on a view change.
-- **Tools** — pen, stroke eraser (spatial hit-test), pan.
-- **Undo / redo** — O(1) command history in the engine.
-- **Save / open** — compact binary `.qsketch` format (round-trips through the
-  Nim serializer).
-- **Export PNG** — tight-cropped, 2× raster export of the inked area.
-- **Zero dependencies at runtime** — no frameworks; one HTML file, one JS file,
-  one CSS file, one `.wasm`. Works from any static host.
-- **Light / dark aware**, responsive toolbar, keyboard shortcuts.
+- **Pressure-sensitive brush**: real stylus pressure (S Pen, Apple Pencil,
+  Wacom via Pointer Events) drives stroke width. Strokes are Catmull-Rom
+  smoothed and rendered as filled vector outlines with rounded caps.
+- **Procreate-style stabilization** (Brush ⚙ panel):
+  - **StreamLine**: a time-based pull on the nib that removes hand jitter.
+    It follows event timestamps, so a 240 Hz S Pen and a 60 Hz mouse feel the
+    same. When the pen lifts, the line eases onto the lift point.
+  - **Smoothing**: evens out the finished path; endpoints stay where you put them.
+- **Pressure settings**: on/off, a soft ↔ firm **pressure curve** with a live
+  preview graph and pen-pressure meter, and **Min size** (width at the
+  lightest touch).
+- **Touch navigation**: pinch to zoom (anchored between your fingers), two
+  fingers to pan, **2-finger tap = undo, 3-finger tap = redo**.
+- **Pen-first input**: fingers draw until a stylus is used, then switch to
+  pan & zoom (configurable: Auto / Draw / Pan & zoom only). Palm rejection
+  ignores touches while the pen is down. The **S Pen side button erases**.
+- **Infinite canvas**: pan and zoom are a pure Canvas2D transform. Committed
+  strokes are cached in a layer, so only the live stroke redraws while you draw.
+- **Tools**: pen, stroke eraser (one drag = one undo step), pan.
+- **Undo / redo**, **Save / open** (`.qsketch`, which keeps each stroke's
+  brush settings), **Export PNG**.
+- **No runtime dependencies**: one HTML file, one JS file, one CSS file and one
+  self-contained `.wasm` with zero imports. Light/dark aware; settings are
+  remembered per browser.
 
 ## Architecture
 
@@ -61,8 +71,8 @@ here reduced to a single command-line pipeline instead of an in-browser IDE.
   never changes) and cached by id — only the in-progress stroke re-tessellates
   per pointer move. This is what keeps it smooth with thousands of strokes.
 - **Nim owns all geometry**, in world space, exported over a minimal C ABI
-  (`qs_begin_stroke`, `qs_add_point`, `qs_commit_stroke`, `qs_erase`, `qs_undo`,
-  `qs_save_ptr`/`qs_load`, …). Buffers cross the boundary as
+  (`qs_begin_stroke`, `qs_add_point`, `qs_live_update`, `qs_commit_stroke`,
+  `qs_erase`, `qs_undo`, `qs_save_ptr`/`qs_load`, …). Buffers cross the boundary as
   `(pointer, count)` pairs read directly from linear memory.
 
 Source layout:
@@ -71,7 +81,7 @@ Source layout:
 |------|------|
 | `src/qsketch.nim` | WASM entry points / ABI |
 | `src/engine/geometry.nim` | vec2 / AABB maths |
-| `src/engine/stroke.nim` | smoothing + variable-width outline tessellation |
+| `src/engine/stroke.nim` | StreamLine + smoothing, variable-width outline tessellation |
 | `src/engine/document.nim` | stroke store, undo/redo, binary (de)serialize |
 | `web/` | the static site (`index.html`, `app.js`, `styles.css`, built `qsketch.wasm`) |
 | `build/walloc.c`, `build/inc/` | freestanding libc shim + stub headers |
@@ -107,14 +117,17 @@ publishes `web/` on every push to `main`.
 
 No secrets or servers required — it's a fully static build.
 
-## Keyboard shortcuts
+## Controls
 
-| Key | Action | Key | Action |
-|-----|--------|-----|--------|
-| `P` | Pen | `Ctrl/⌘ Z` | Undo |
-| `E` | Eraser | `Ctrl/⌘ Shift Z` / `Ctrl Y` | Redo |
-| `H` / hold `Space` | Pan | `+` / `-` | Zoom |
-| scroll | Zoom to cursor | `0` | Reset view |
+| Input | Action | Input | Action |
+|-------|--------|-------|--------|
+| Pen / mouse | Draw | S Pen side button | Erase while held |
+| Pinch | Zoom | Two-finger drag | Pan |
+| 2-finger tap | Undo | 3-finger tap | Redo |
+| `P` / `E` / `H` | Pen / Eraser / Pan | hold `Space` | Pan |
+| `[` / `]` | Size − / + | `B` | Brush settings |
+| `Ctrl/⌘ Z` | Undo | `Ctrl/⌘ Shift Z`, `Ctrl Y` | Redo |
+| scroll | Zoom to cursor | `+` / `-` / `0` | Zoom / reset view |
 
 ## Credits & licence
 

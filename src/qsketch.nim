@@ -36,14 +36,21 @@ proc qs_alloc(n: int32): pointer {.wexport.} =
 # Stroke capture.
 # --------------------------------------------------------------------------
 
-proc qs_begin_stroke(color: uint32, baseWidth: float32) {.wexport.} =
-  live = newStroke(color, baseWidth)
+proc qs_begin_stroke(color: uint32, baseWidth, minRatio, smoothing,
+                     streamline: float32) {.wexport.} =
+  ## Start a stroke. `minRatio` is the width at zero pressure relative to
+  ## `baseWidth`; `smoothing` and `streamline` are 0..1 stabiliser strengths.
+  live = newStroke(color, baseWidth, minRatio, smoothing, streamline)
   drawing = true
 
-proc qs_add_point(x, y, pressure: float32) {.wexport.} =
+proc qs_add_point(x, y, pressure, timeMs: float32) {.wexport.} =
+  ## Queue one pen sample. Cheap: tessellation is deferred to
+  ## qs_live_update so a burst of coalesced events costs one rebuild.
   if not drawing: return
-  live.addSample(vec2(x, y), pressure)
-  live.retessellate()
+  live.capture(vec2(x, y), pressure, timeMs)
+
+proc qs_live_update() {.wexport.} =
+  if drawing: live.retessellate()
 
 proc qs_live_outline_ptr(): pointer {.wexport.} =
   if live.outline.len == 0: return nil
@@ -53,7 +60,9 @@ proc qs_live_outline_count(): int32 {.wexport.} =
   int32(live.outline.len)
 
 proc qs_commit_stroke(): int32 {.wexport.} =
+  if not drawing: return -1
   drawing = false
+  live.finishCapture()
   if live.raw.len == 0: return -1
   live.retessellate()
   int32(doc.addStroke(live))
@@ -61,6 +70,7 @@ proc qs_commit_stroke(): int32 {.wexport.} =
 proc qs_cancel_stroke() {.wexport.} =
   drawing = false
   live = newStroke(0, 1)
+  live.retessellate()
 
 # --------------------------------------------------------------------------
 # Committed stroke access (for JS Path2D caching).
@@ -92,6 +102,13 @@ proc qs_stroke_color(id: int32): uint32 {.wexport.} =
 
 proc qs_erase(x, y, radius: float32): int32 {.wexport.} =
   int32(doc.eraseAt(vec2(x, y), radius))
+
+proc qs_erase_begin() {.wexport.} =
+  ## Group every qs_erase until qs_erase_end into a single undo step.
+  doc.beginEraseGroup()
+
+proc qs_erase_end() {.wexport.} =
+  doc.endEraseGroup()
 
 proc qs_clear(): int32 {.wexport.} =
   int32(doc.clearAll())

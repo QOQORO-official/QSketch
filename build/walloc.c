@@ -83,7 +83,12 @@ int strcmp(const char *a, const char *b) {
 }
 char *strcpy(char *d, const char *s) { char *r = d; while ((*d++ = *s++)) { } return r; }
 
-/* --- math: lower to wasm ops / builtins where possible --- */
+/* --- math ---------------------------------------------------------------
+ * Only functions with a native wasm instruction may use __builtin_*: for
+ * anything else (exp, sin, pow, round, ...) clang lowers the builtin back to a
+ * libcall, i.e. the function would call itself forever. Those are either
+ * written out by hand below or deliberately left undefined, so an accidental
+ * use shows up as a wasm import instead of a hang. */
 double fabs(double x) { return __builtin_fabs(x); }
 float fabsf(float x) { return __builtin_fabsf(x); }
 double sqrt(double x) { return __builtin_sqrt(x); }
@@ -93,36 +98,29 @@ float floorf(float x) { return __builtin_floorf(x); }
 double ceil(double x) { return __builtin_ceil(x); }
 float ceilf(float x) { return __builtin_ceilf(x); }
 double trunc(double x) { return __builtin_trunc(x); }
-double round(double x) { return __builtin_round(x); }
+/* round half away from zero, built from instructions wasm does have */
+double round(double x) {
+  return x < 0.0 ? -__builtin_floor(-x + 0.5) : __builtin_floor(x + 0.5);
+}
 double fmod(double a, double b) { return a - b * __builtin_trunc(a / b); }
 double hypot(double a, double b) { return __builtin_sqrt(a * a + b * b); }
 int abs(int x) { return x < 0 ? -x : x; }
 long labs(long x) { return x < 0 ? -x : x; }
 
-/* Nim's formatfloat (used by $float) can reference these; give correct,
- * compact implementations so numeric output never silently corrupts. */
-double ldexp(double x, int e) { return x * __builtin_exp2((double)e); }
-double frexp(double x, int *e) {
-  if (x == 0.0) { *e = 0; return 0.0; }
-  int ex = (int)__builtin_ceil(__builtin_log2(__builtin_fabs(x)));
-  double m = x * __builtin_exp2((double)-ex);
-  while (__builtin_fabs(m) >= 1.0) { m *= 0.5; ex++; }
-  while (__builtin_fabs(m) < 0.5) { m *= 2.0; ex--; }
-  *e = ex;
-  return m;
+/* Nim's float formatting may reference these; exact via repeated scaling. */
+double ldexp(double x, int e) {
+  while (e > 0) { x *= 2.0; e--; }
+  while (e < 0) { x *= 0.5; e++; }
+  return x;
 }
-double pow(double b, double e) { return __builtin_pow(b, e); }
-double exp(double x) { return __builtin_exp(x); }
-double log(double x) { return __builtin_log(x); }
-double log10(double x) { return __builtin_log10(x); }
-double log2(double x) { return __builtin_log2(x); }
-double sin(double x) { return __builtin_sin(x); }
-double cos(double x) { return __builtin_cos(x); }
-double tan(double x) { return __builtin_tan(x); }
-double atan2(double y, double x) { return __builtin_atan2(y, x); }
-double atan(double x) { return __builtin_atan(x); }
-double asin(double x) { return __builtin_asin(x); }
-double acos(double x) { return __builtin_acos(x); }
+double frexp(double x, int *e) {
+  int ex = 0;
+  if (x == 0.0 || x != x) { *e = 0; return x; }
+  while (__builtin_fabs(x) >= 1.0) { x *= 0.5; ex++; }
+  while (__builtin_fabs(x) < 0.5) { x *= 2.0; ex--; }
+  *e = ex;
+  return x;
+}
 
 /* --- unreachable stubs: satisfy the linker, never meaningfully called --- */
 void abort(void) { __builtin_trap(); }

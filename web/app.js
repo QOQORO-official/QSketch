@@ -1,50 +1,105 @@
 /* QSketch front-end.
  *
- * The Nim/WASM engine owns all geometry (stroke smoothing, tessellation,
- * hit-testing, undo, serialization) in *world* coordinates. This file owns
- * the camera and rendering: pan/zoom are a single Canvas2D setTransform, so
- * the engine never re-runs for a view change. Committed strokes are turned
- * into a Path2D exactly once (their outline never changes) and cached by id;
- * only the in-progress stroke is re-tessellated per pointer move.
+ * The Nim/WASM engine owns all geometry (StreamLine + smoothing, stroke
+ * tessellation, hit-testing, undo, serialization) in *world* coordinates.
+ * This file owns input, the camera and rendering:
+ *
+ *  - Pen / mouse draw. Fingers draw until a stylus is seen, then fingers
+ *    navigate (Procreate style); configurable in Brush settings.
+ *  - One finger pans (when not drawing), two fingers pinch-zoom + pan,
+ *    two-finger tap = undo, three-finger tap = redo.
+ *  - Palm rejection: touches are ignored while the pen is down, and a pen
+ *    touching down cancels any touch gesture in progress (the palm).
+ *  - Committed strokes are drawn once into a cached layer; while drawing we
+ *    only blit that layer and fill the live stroke.
  */
 'use strict';
 
 const WASM_URL = 'qsketch.wasm';
+const SETTINGS_KEY = 'qsketch.brush.v1';
 
-// ---- engine handle (filled after load) ----
-let E = null;        // wasm exports
-let mem = null;      // DataView-free typed views rebuilt if memory grows
+let E = null;                              // wasm exports
 
 function f32(ptr, count) { return new Float32Array(E.memory.buffer, ptr, count); }
 function u8(ptr, count)  { return new Uint8Array(E.memory.buffer, ptr, count); }
 
 // ---- camera: screen = world * scale + offset (CSS pixels) ----
-const cam = { x: 0, y: 0, scale: 1 };        // offset x/y, zoom
+const cam = { x: 0, y: 0, scale: 1 };
+const MIN_ZOOM = 0.05, MAX_ZOOM = 20;
 function screenToWorld(sx, sy) {
   return { x: (sx - cam.x) / cam.scale, y: (sy - cam.y) / cam.scale };
 }
+function zoomAbout(sx, sy, factor) {
+  const before = screenToWorld(sx, sy);
+  cam.scale = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, cam.scale * factor));
+  cam.x = sx - before.x * cam.scale;
+  cam.y = sy - before.y * cam.scale;
+  updateZoomLabel();
+  viewChanged();
+}
 
-// ---- state ----
+// ---- brush settings (persisted per browser) ----
+const DEFAULTS = Object.freeze({
+  streamline: 0.30,      // 0..1  time-based pull on the nib
+  smoothing: 0.35,       // 0..1  moving average of the stroke path
+  pressure: true,        // pen pressure drives width
+  curve: 0,              // -1 soft .. +1 firm  (gamma = 3^curve)
+  minSize: 0.20,         // width at zero pressure, fraction of Size
+  fingers: 'auto',       // 'auto' | 'draw' | 'navigate'
+  penButtonErase: true,  // S Pen / stylus barrel button = eraser
+});
+let settings = loadSettings();
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) return Object.assign({}, DEFAULTS, JSON.parse(raw));
+  } catch (_) { /* private mode / blocked storage */ }
+  return Object.assign({}, DEFAULTS);
+}
+function saveSettings() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch (_) {}
+}
+
+// Map raw stylus pressure through the user's curve. Non-pen input (mouse,
+// finger) has no real pressure, so it always draws at full Size.
+function mapPressure(p, pointerType) {
+  if (pointerType !== 'pen' || !settings.pressure) return 1;
+  p = Math.min(1, Math.max(0, p));
+  return Math.pow(p, Math.pow(3, settings.curve));
+}
+
+// ---- tool state ----
 let tool = 'pen';
 let color = '#1b1d23';
 let width = 4;
 let dpr = Math.max(1, window.devicePixelRatio || 1);
+let penSeen = false;               // a stylus has been used on this page
 
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 
-// per-stroke Path2D cache: id -> {path, css}
-const pathCache = new Map();
-let liveStroke = null;         // {path, css} for the in-progress stroke
-let drawing = false;
-let panning = false;
-let spaceHeld = false;
-let lastPan = null;
-let activePointerId = null;
+// committed strokes are rendered into this cached layer
+const layer = document.createElement('canvas');
+const lctx = layer.getContext('2d', { alpha: false });
+let layerDirty = true;
 let needsRedraw = true;
 
+const pathCache = new Map();       // stroke id -> {path, css}
+let livePath = null;               // Path2D of the in-progress stroke
+let liveCss = '';
+let liveDirty = false;             // engine has new samples to tessellate
+
+// ---- input state ----
+let stroke = null;                 // {id, type, erase, started}
+let mousePan = null;               // {x, y} while panning with mouse/pen
+let spaceHeld = false;
+const touches = new Map();         // touch pointerId -> {x, y, sx, sy}
+let gesture = null;                // {kind:'pan', id} | {kind:'pinch', cx, cy, d}
+let tap = null;                    // {t, max, moved} multi-finger tap tracking
+
 // -------------------------------------------------------------------------
-// colour helpers
+// colour + theme helpers
 // -------------------------------------------------------------------------
 function hexToRGBA(hex) {              // "#rrggbb" -> 0xRRGGBBAA (>>>0)
   const h = hex.replace('#', '');
@@ -56,6 +111,15 @@ function hexToRGBA(hex) {              // "#rrggbb" -> 0xRRGGBBAA (>>>0)
 function rgbaToCss(v) {                 // 0xRRGGBBAA -> css
   const r = (v >>> 24) & 0xff, g = (v >>> 16) & 0xff, b = (v >>> 8) & 0xff, a = v & 0xff;
   return `rgba(${r},${g},${b},${(a / 255).toFixed(3)})`;
+}
+let theme = { bg: '#fbfcfe', dot: '#c7cede' };
+function readTheme() {
+  const cs = getComputedStyle(document.documentElement);
+  theme = {
+    bg: cs.getPropertyValue('--canvas-bg').trim() || '#fbfcfe',
+    dot: cs.getPropertyValue('--dot').trim() || '#c7cede',
+  };
+  viewChanged();
 }
 
 // -------------------------------------------------------------------------
@@ -84,189 +148,319 @@ function getCommittedPath(id) {
 // -------------------------------------------------------------------------
 // rendering
 // -------------------------------------------------------------------------
+function viewChanged() { layerDirty = true; needsRedraw = true; }
+function invalidate() { needsRedraw = true; }
+
 function resize() {
   dpr = Math.max(1, window.devicePixelRatio || 1);
   const w = canvas.clientWidth, h = canvas.clientHeight;
-  canvas.width = Math.round(w * dpr);
-  canvas.height = Math.round(h * dpr);
-  needsRedraw = true;
+  canvas.width = layer.width = Math.round(w * dpr);
+  canvas.height = layer.height = Math.round(h * dpr);
+  viewChanged();
 }
 
-function drawBackground(w, h) {
-  ctx.fillStyle = getVar('--canvas-bg');
-  ctx.fillRect(0, 0, w, h);
+function drawBackground(c, w, h) {
+  c.fillStyle = theme.bg;
+  c.fillRect(0, 0, w, h);
   // dotted grid in screen space, following the camera
-  const base = 24;                             // world units between dots
-  let step = base * cam.scale;
-  while (step < 14) step *= 4;                  // keep dots from crowding
+  let step = 24 * cam.scale;                  // 24 world units between dots
+  while (step < 14) step *= 4;                // keep dots from crowding
   while (step > 120) step /= 4;
   const ox = ((cam.x % step) + step) % step;
   const oy = ((cam.y % step) + step) % step;
-  ctx.fillStyle = getVar('--dot');
   const r = Math.min(1.4, Math.max(0.7, cam.scale));
-  for (let x = ox; x < w; x += step) {
-    for (let y = oy; y < h; y += step) {
-      ctx.beginPath();
-      ctx.arc(x, y, r, 0, 6.283185307);
-      ctx.fill();
-    }
-  }
+  c.fillStyle = theme.dot;
+  c.beginPath();                              // one path, one fill
+  for (let x = ox; x < w; x += step)
+    for (let y = oy; y < h; y += step) c.rect(x - r, y - r, r * 2, r * 2);
+  c.fill();
 }
 
-function render() {
+function renderLayer() {
   const w = canvas.clientWidth, h = canvas.clientHeight;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  drawBackground(w, h);
-
-  // world-space transform for strokes
-  ctx.setTransform(cam.scale * dpr, 0, 0, cam.scale * dpr, cam.x * dpr, cam.y * dpr);
-
+  lctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawBackground(lctx, w, h);
+  lctx.setTransform(cam.scale * dpr, 0, 0, cam.scale * dpr, cam.x * dpr, cam.y * dpr);
   const n = E.qs_stroke_count();
   for (let id = 0; id < n; id++) {
     if (!E.qs_stroke_alive(id)) continue;
     const e = getCommittedPath(id);
-    ctx.fillStyle = e.css;
-    ctx.fill(e.path);
+    lctx.fillStyle = e.css;
+    lctx.fill(e.path);
   }
-  if (liveStroke) {
-    ctx.fillStyle = liveStroke.css;
-    ctx.fill(liveStroke.path);
-  }
+}
+
+function render() {
+  if (layerDirty) { layerDirty = false; renderLayer(); }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(layer, 0, 0);
+  if (livePath) {
+    ctx.setTransform(cam.scale * dpr, 0, 0, cam.scale * dpr, cam.x * dpr, cam.y * dpr);
+    ctx.fillStyle = liveCss;
+    ctx.fill(livePath);
+  }
 }
 
 function frame() {
+  if (liveDirty) {
+    // Tessellate once per frame no matter how many samples arrived.
+    liveDirty = false;
+    E.qs_live_update();
+    livePath = outlineToPath(E.qs_live_outline_ptr(), E.qs_live_outline_count());
+    needsRedraw = true;
+  }
   if (needsRedraw) { needsRedraw = false; render(); }
   requestAnimationFrame(frame);
 }
-function invalidate() { needsRedraw = true; }
-
-function getVar(name) {
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#000';
-}
 
 // -------------------------------------------------------------------------
-// pointer input
+// drawing / erasing
 // -------------------------------------------------------------------------
-function pressureOf(ev) {
-  // Pen gives real pressure; mouse/touch report 0 or 0.5 -> use a sane default.
-  if (ev.pointerType === 'pen' && ev.pressure > 0) return ev.pressure;
-  if (ev.pressure && ev.pressure !== 0.5) return ev.pressure;
-  return 0.5;
+function localXY(ev) {
+  const r = canvas.getBoundingClientRect();
+  return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+}
+function capture(ev) {
+  // Best effort: some browsers throw for pointers they consider inactive.
+  try { canvas.setPointerCapture(ev.pointerId); } catch (_) {}
+}
+function samplesOf(ev) {
+  const list = ev.getCoalescedEvents ? ev.getCoalescedEvents() : null;
+  return list && list.length ? list : [ev];
+}
+function penButtonDown(ev) {
+  // Stylus barrel button (S Pen side button) reports as button 2 / buttons&2;
+  // an eraser tip reports as button 5 / buttons&32.
+  return (ev.buttons & 2) !== 0 || (ev.buttons & 32) !== 0 || ev.button === 2 || ev.button === 5;
 }
 
-function beginStroke(ev) {
-  drawing = true;
-  activePointerId = ev.pointerId;
-  E.qs_begin_stroke(hexToRGBA(color), width);
-  liveStroke = { path: new Path2D(), css: rgbaToCss(hexToRGBA(color)) };
-  addPoint(ev);
-}
-
-function addPoint(ev) {
-  const events = ev.getCoalescedEvents ? ev.getCoalescedEvents() : [ev];
-  const list = events.length ? events : [ev];
-  const rect = canvas.getBoundingClientRect();
-  for (const e of list) {
-    const wpt = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
-    E.qs_add_point(wpt.x, wpt.y, pressureOf(e));
+function beginStroke(ev, erase) {
+  stroke = { id: ev.pointerId, type: ev.pointerType, erase, started: performance.now() };
+  if (erase) {
+    E.qs_erase_begin();
+    eraseWith(ev);
+    return;
   }
-  const ptr = E.qs_live_outline_ptr();
-  const cnt = E.qs_live_outline_count();
-  liveStroke = { path: outlineToPath(ptr, cnt), css: rgbaToCss(hexToRGBA(color)) };
-  invalidate();
+  const rgba = hexToRGBA(color);
+  const minSize = settings.pressure ? settings.minSize : 1;
+  E.qs_begin_stroke(rgba, width, minSize, settings.smoothing, settings.streamline);
+  liveCss = rgbaToCss(rgba);
+  feedStroke(ev);
+}
+
+function feedStroke(ev) {
+  for (const e of samplesOf(ev)) {
+    const p = localXY(e);
+    const w = screenToWorld(p.x, p.y);
+    E.qs_add_point(w.x, w.y, mapPressure(e.pressure, e.pointerType), e.timeStamp);
+    if (e.pointerType === 'pen') showPressure(e.pressure);
+  }
+  liveDirty = true;
+}
+
+function eraseWith(ev) {
+  const radius = Math.max(8, width * 1.5) / cam.scale;
+  let removed = 0;
+  for (const e of samplesOf(ev)) {
+    const p = localXY(e);
+    const w = screenToWorld(p.x, p.y);
+    removed += E.qs_erase(w.x, w.y, radius);
+  }
+  if (removed > 0) { syncUndo(); viewChanged(); }
 }
 
 function endStroke() {
-  if (!drawing) return;
-  drawing = false;
-  activePointerId = null;
+  if (!stroke) return;
+  const s = stroke;
+  stroke = null;
+  if (s.erase) { E.qs_erase_end(); syncUndo(); return; }
   const id = E.qs_commit_stroke();
-  liveStroke = null;
-  if (id >= 0) getCommittedPath(id);     // warm the cache
+  livePath = null; liveDirty = false;
+  if (id >= 0) getCommittedPath(id);
+  syncUndo();
+  viewChanged();
+}
+
+function cancelStroke() {
+  if (!stroke) return;
+  if (stroke.erase) E.qs_erase_end(); else E.qs_cancel_stroke();
+  stroke = null;
+  livePath = null; liveDirty = false;
   syncUndo();
   invalidate();
 }
 
-function eraseAt(ev) {
-  const rect = canvas.getBoundingClientRect();
-  const wpt = screenToWorld(ev.clientX - rect.left, ev.clientY - rect.top);
-  const rWorld = Math.max(6, width * 1.5) / cam.scale;
-  const removed = E.qs_erase(wpt.x, wpt.y, rWorld);
-  if (removed > 0) { syncUndo(); invalidate(); }
+// -------------------------------------------------------------------------
+// touch gestures
+// -------------------------------------------------------------------------
+function fingersDraw() {
+  return settings.fingers === 'draw' || (settings.fingers === 'auto' && !penSeen);
+}
+function pinchInfo() {
+  const [a, b] = touches.values();
+  return { cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2, d: Math.hypot(a.x - b.x, a.y - b.y) };
+}
+function startPinch() {
+  gesture = Object.assign({ kind: 'pinch' }, pinchInfo());
+}
+function abortTouches() {                 // palm rejection: the pen wins
+  if (stroke && stroke.type === 'touch') cancelStroke();
+  touches.clear(); gesture = null; tap = null;
 }
 
-function isPanGesture(ev) {
-  return tool === 'pan' || spaceHeld || ev.button === 1 ||
-         (ev.pointerType === 'touch' && ev.button === -1 && ev.isPrimary === false);
+function touchDown(ev) {
+  if (stroke && stroke.type !== 'touch') return;          // palm while pen/mouse draws
+  const p = localXY(ev);
+  touches.set(ev.pointerId, { x: p.x, y: p.y, sx: p.x, sy: p.y });
+  capture(ev);
+
+  if (touches.size === 1) {
+    tap = { t: performance.now(), max: 1, moved: false };
+    if (fingersDraw() && tool !== 'pan' && !spaceHeld) {
+      beginStroke(ev, tool === 'eraser');
+    } else {
+      gesture = { kind: 'pan', id: ev.pointerId };
+    }
+    return;
+  }
+  if (tap) tap.max = Math.max(tap.max, touches.size);
+  if (stroke) {
+    // A second finger turns a just-started finger stroke into a gesture;
+    // a stroke that was already well under way is kept.
+    if (performance.now() - stroke.started < 250) cancelStroke(); else endStroke();
+  }
+  startPinch();
 }
 
+function touchMove(ev) {
+  const t = touches.get(ev.pointerId);
+  if (!t) return;
+  const p = localXY(ev);
+  const dx = p.x - t.x, dy = p.y - t.y;
+  t.x = p.x; t.y = p.y;
+  if (tap && Math.hypot(p.x - t.sx, p.y - t.sy) > 12) tap.moved = true;
+
+  if (stroke && stroke.id === ev.pointerId) {
+    if (stroke.erase) eraseWith(ev); else feedStroke(ev);
+    return;
+  }
+  if (!gesture) return;
+  if (gesture.kind === 'pan' && gesture.id === ev.pointerId) {
+    cam.x += dx; cam.y += dy;
+    viewChanged();
+  } else if (gesture.kind === 'pinch' && touches.size >= 2) {
+    const now = pinchInfo();
+    // Keep the world point under the old centroid under the new centroid:
+    // this does pinch-zoom and two-finger pan in one step.
+    const before = screenToWorld(gesture.cx, gesture.cy);
+    const f = gesture.d > 0 && now.d > 0 ? now.d / gesture.d : 1;
+    cam.scale = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, cam.scale * f));
+    cam.x = now.cx - before.x * cam.scale;
+    cam.y = now.cy - before.y * cam.scale;
+    Object.assign(gesture, now);
+    updateZoomLabel();
+    viewChanged();
+  }
+}
+
+function touchUp(ev) {
+  if (!touches.has(ev.pointerId)) return;
+  touches.delete(ev.pointerId);
+
+  if (stroke && stroke.id === ev.pointerId) endStroke();
+
+  if (touches.size >= 2) {
+    startPinch();                                   // re-seed with remaining pair
+  } else if (touches.size === 1) {
+    // pinch -> one finger left: keep panning with it, never start drawing
+    gesture = { kind: 'pan', id: touches.keys().next().value };
+  } else {
+    gesture = null;
+    if (tap && !tap.moved && tap.max >= 2 && performance.now() - tap.t < 350) {
+      if (tap.max === 2) doUndo(true); else doRedo(true);
+    }
+    tap = null;
+  }
+}
+
+// -------------------------------------------------------------------------
+// pointer routing
+// -------------------------------------------------------------------------
 canvas.addEventListener('pointerdown', (ev) => {
-  canvas.setPointerCapture(ev.pointerId);
   hideHint();
-  if (isPanGesture(ev)) {
-    panning = true; lastPan = { x: ev.clientX, y: ev.clientY };
+  closePanel();
+  if (ev.pointerType === 'touch') { touchDown(ev); return; }
+
+  if (ev.pointerType === 'pen') {
+    markPen();
+    abortTouches();
+  }
+  if (stroke) return;                               // already drawing with something
+
+  const panGesture = tool === 'pan' || spaceHeld || ev.button === 1;
+  if (panGesture) {
+    capture(ev);
+    mousePan = { id: ev.pointerId, x: ev.clientX, y: ev.clientY };
     canvas.style.cursor = 'grabbing';
     return;
   }
-  if (ev.button !== 0 && ev.pointerType === 'mouse') return;
-  if (tool === 'eraser') { drawing = true; activePointerId = ev.pointerId; eraseAt(ev); return; }
-  beginStroke(ev);
+  const penErase = ev.pointerType === 'pen' && settings.penButtonErase && penButtonDown(ev);
+  if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+  capture(ev);
+  beginStroke(ev, tool === 'eraser' || penErase);
 });
 
 canvas.addEventListener('pointermove', (ev) => {
-  if (panning) {
-    cam.x += ev.clientX - lastPan.x;
-    cam.y += ev.clientY - lastPan.y;
-    lastPan = { x: ev.clientX, y: ev.clientY };
-    invalidate();
+  if (ev.pointerType === 'touch') { touchMove(ev); return; }
+  if (ev.pointerType === 'pen') { markPen(); if (!stroke) showPressure(ev.pressure); }
+  if (mousePan && mousePan.id === ev.pointerId) {
+    cam.x += ev.clientX - mousePan.x;
+    cam.y += ev.clientY - mousePan.y;
+    mousePan.x = ev.clientX; mousePan.y = ev.clientY;
+    viewChanged();
     return;
   }
-  if (!drawing || ev.pointerId !== activePointerId) return;
-  if (tool === 'eraser') eraseAt(ev);
-  else addPoint(ev);
+  if (!stroke || stroke.id !== ev.pointerId) return;
+  if (stroke.erase) eraseWith(ev); else feedStroke(ev);
 });
 
-function stopPointer(ev) {
-  if (panning) {
-    panning = false; lastPan = null;
-    canvas.style.cursor = tool === 'pan' ? 'grab' : 'crosshair';
+function pointerEnd(ev) {
+  if (ev.pointerType === 'touch') { touchUp(ev); return; }
+  if (mousePan && mousePan.id === ev.pointerId) {
+    mousePan = null;
+    setCursor();
     return;
   }
-  if (tool === 'eraser') { drawing = false; activePointerId = null; return; }
-  endStroke();
+  if (stroke && stroke.id === ev.pointerId) endStroke();
 }
-canvas.addEventListener('pointerup', stopPointer);
-canvas.addEventListener('pointercancel', stopPointer);
-canvas.addEventListener('lostpointercapture', () => { if (drawing) endStroke(); });
+canvas.addEventListener('pointerup', pointerEnd);
+canvas.addEventListener('pointercancel', pointerEnd);
+canvas.addEventListener('lostpointercapture', (ev) => {
+  if (stroke && stroke.id === ev.pointerId && ev.pointerType !== 'touch') endStroke();
+});
+// S Pen side-button clicks and long-presses must not open a context menu.
+canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
 
-// wheel: zoom toward cursor (ctrl/pinch also zooms); shift+wheel pans x
+// wheel: zoom toward cursor (ctrl+wheel = trackpad pinch); shift+wheel pans
 canvas.addEventListener('wheel', (ev) => {
   ev.preventDefault();
-  const rect = canvas.getBoundingClientRect();
-  const cx = ev.clientX - rect.left, cy = ev.clientY - rect.top;
-  if (ev.ctrlKey || !ev.shiftKey) {
-    const before = screenToWorld(cx, cy);
-    const factor = Math.exp(-ev.deltaY * 0.0015);
-    cam.scale = Math.min(20, Math.max(0.05, cam.scale * factor));
-    // keep the point under the cursor fixed
-    cam.x = cx - before.x * cam.scale;
-    cam.y = cy - before.y * cam.scale;
-    updateZoomLabel();
-  } else {
+  const p = localXY(ev);
+  if (ev.shiftKey && !ev.ctrlKey) {
     cam.x -= ev.deltaX || ev.deltaY;
-    cam.y -= ev.shiftKey ? 0 : ev.deltaY;
+    viewChanged();
+    return;
   }
-  invalidate();
+  zoomAbout(p.x, p.y, Math.exp(-ev.deltaY * (ev.ctrlKey ? 0.01 : 0.0015)));
 }, { passive: false });
 
 // -------------------------------------------------------------------------
 // UI wiring
 // -------------------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
 const PALETTE = ['#1b1d23', '#e5484d', '#f5a524', '#30a46c', '#4f6bed', '#8e4ec6', '#e93d82', '#ffffff'];
 
 function buildSwatches() {
-  const host = document.getElementById('swatches');
+  const host = $('swatches');
   PALETTE.forEach((c, i) => {
     const b = document.createElement('button');
     b.className = 'swatch';
@@ -279,72 +473,77 @@ function buildSwatches() {
 }
 function setColor(c, btn) {
   color = c;
-  document.getElementById('colorInput').value = c;
+  $('colorInput').value = c;
   document.querySelectorAll('.swatch').forEach(s => s.setAttribute('aria-pressed', 'false'));
   if (btn) btn.setAttribute('aria-pressed', 'true');
   if (tool !== 'pen') selectTool('pen');
+}
+function setCursor() {
+  canvas.style.cursor = tool === 'pan' ? 'grab' : (tool === 'eraser' ? 'cell' : 'crosshair');
 }
 function selectTool(t) {
   tool = t;
   document.querySelectorAll('.tool').forEach(b =>
     b.setAttribute('aria-pressed', String(b.dataset.tool === t)));
-  canvas.style.cursor = t === 'pan' ? 'grab' : (t === 'eraser' ? 'cell' : 'crosshair');
+  setCursor();
+}
+function setWidth(w) {
+  width = Math.max(1, Math.min(48, Math.round(w)));
+  $('widthInput').value = width;
+  $('widthVal').textContent = width;
 }
 function updateZoomLabel() {
-  document.getElementById('zoomVal').textContent = Math.round(cam.scale * 100) + '%';
+  $('zoomVal').textContent = Math.round(cam.scale * 100) + '%';
 }
 function syncUndo() {
-  document.getElementById('undoBtn').disabled = !E.qs_can_undo();
-  document.getElementById('redoBtn').disabled = !E.qs_can_redo();
+  $('undoBtn').disabled = !E.qs_can_undo();
+  $('redoBtn').disabled = !E.qs_can_redo();
 }
+function doUndo(fromGesture) {
+  if (E.qs_undo()) { syncUndo(); viewChanged(); if (fromGesture) toast('Undo'); }
+}
+function doRedo(fromGesture) {
+  if (E.qs_redo()) { syncUndo(); viewChanged(); if (fromGesture) toast('Redo'); }
+}
+function resetView() {
+  cam.x = 0; cam.y = 0; cam.scale = 1;
+  updateZoomLabel(); viewChanged();
+}
+function zoomCenter(f) { zoomAbout(canvas.clientWidth / 2, canvas.clientHeight / 2, f); }
 
 document.querySelectorAll('.tool').forEach(b =>
   b.addEventListener('click', () => selectTool(b.dataset.tool)));
-document.getElementById('colorInput').addEventListener('input', (e) => setColor(e.target.value, null));
-document.getElementById('widthInput').addEventListener('input', (e) => {
-  width = parseInt(e.target.value, 10);
-  document.getElementById('widthVal').textContent = width;
+$('colorInput').addEventListener('input', (e) => setColor(e.target.value, null));
+$('widthInput').addEventListener('input', (e) => setWidth(parseInt(e.target.value, 10)));
+$('undoBtn').addEventListener('click', () => doUndo(false));
+$('redoBtn').addEventListener('click', () => doRedo(false));
+$('clearBtn').addEventListener('click', () => {
+  if (E.qs_clear() > 0) { syncUndo(); viewChanged(); }
 });
-document.getElementById('undoBtn').addEventListener('click', () => { if (E.qs_undo()) { syncUndo(); invalidate(); } });
-document.getElementById('redoBtn').addEventListener('click', () => { if (E.qs_redo()) { syncUndo(); invalidate(); } });
-document.getElementById('clearBtn').addEventListener('click', () => {
-  if (E.qs_clear() > 0) { syncUndo(); invalidate(); }
-});
-document.getElementById('zoomIn').addEventListener('click', () => zoomCenter(1.25));
-document.getElementById('zoomOut').addEventListener('click', () => zoomCenter(0.8));
-document.getElementById('zoomFit').addEventListener('click', () => {
-  cam.x = 0; cam.y = 0; cam.scale = 1; updateZoomLabel(); invalidate();
-});
-function zoomCenter(f) {
-  const cx = canvas.clientWidth / 2, cy = canvas.clientHeight / 2;
-  const before = screenToWorld(cx, cy);
-  cam.scale = Math.min(20, Math.max(0.05, cam.scale * f));
-  cam.x = cx - before.x * cam.scale;
-  cam.y = cy - before.y * cam.scale;
-  updateZoomLabel(); invalidate();
-}
+$('zoomIn').addEventListener('click', () => zoomCenter(1.25));
+$('zoomOut').addEventListener('click', () => zoomCenter(0.8));
+$('zoomFit').addEventListener('click', resetView);
 
 // save / open / png
-document.getElementById('saveBtn').addEventListener('click', () => {
+$('saveBtn').addEventListener('click', () => {
   const ptr = E.qs_save_ptr(), len = E.qs_save_len();
   const bytes = u8(ptr, len).slice();
-  const blob = new Blob([bytes], { type: 'application/octet-stream' });
-  downloadBlob(blob, 'drawing.qsketch');
+  downloadBlob(new Blob([bytes], { type: 'application/octet-stream' }), 'drawing.qsketch');
 });
-document.getElementById('openBtn').addEventListener('click', () => document.getElementById('fileInput').click());
-document.getElementById('fileInput').addEventListener('change', async (e) => {
+$('openBtn').addEventListener('click', () => $('fileInput').click());
+$('fileInput').addEventListener('change', async (e) => {
   const file = e.target.files[0]; if (!file) return;
   const buf = new Uint8Array(await file.arrayBuffer());
   const dst = E.qs_alloc(buf.length);
   u8(dst, buf.length).set(buf);
   if (E.qs_load(dst, buf.length)) {
-    pathCache.clear(); liveStroke = null; syncUndo(); invalidate();
+    pathCache.clear(); livePath = null; syncUndo(); viewChanged();
   } else {
     alert('Not a valid .qsketch file.');
   }
   e.target.value = '';
 });
-document.getElementById('pngBtn').addEventListener('click', exportPNG);
+$('pngBtn').addEventListener('click', exportPNG);
 
 function downloadBlob(blob, name) {
   const a = document.createElement('a');
@@ -375,7 +574,7 @@ function exportPNG() {
   const off = document.createElement('canvas');
   off.width = w * sc; off.height = h * sc;
   const c = off.getContext('2d');
-  c.fillStyle = getVar('--canvas-bg'); c.fillRect(0, 0, off.width, off.height);
+  c.fillStyle = theme.bg; c.fillRect(0, 0, off.width, off.height);
   c.setTransform(sc, 0, 0, sc, sc * (pad - minx), sc * (pad - miny));
   for (let id = 0; id < n; id++) {
     if (!E.qs_stroke_alive(id)) continue;
@@ -385,36 +584,181 @@ function exportPNG() {
   off.toBlob(b => downloadBlob(b, 'qsketch.png'), 'image/png');
 }
 
-// keyboard
+// -------------------------------------------------------------------------
+// Brush settings panel
+// -------------------------------------------------------------------------
+const panel = $('brushPanel');
+function openPanel() {
+  panel.hidden = false;
+  $('brushBtn').setAttribute('aria-expanded', 'true');
+  if (lastPenPressure != null) showPressure(lastPenPressure); else drawCurve();
+}
+function closePanel() { if (!panel.hidden) { panel.hidden = true; $('brushBtn').setAttribute('aria-expanded', 'false'); } }
+$('brushBtn').addEventListener('click', () => (panel.hidden ? openPanel() : closePanel()));
+$('panelClose').addEventListener('click', closePanel);
+
+const pct = (v) => Math.round(v * 100) + '%';
+function curveLabel(c) {
+  if (Math.abs(c) < 0.05) return 'Linear';
+  return (c < 0 ? 'Soft ' : 'Firm ') + Math.round(Math.abs(c) * 100) + '%';
+}
+
+function bindRange(id, key, toValue, fromValue, label) {
+  const el = $(id), out = $(id + 'Val');
+  const show = () => { out.textContent = label(settings[key]); };
+  el.value = fromValue(settings[key]);
+  show();
+  el.addEventListener('input', () => {
+    settings[key] = toValue(parseFloat(el.value));
+    show(); saveSettings(); drawCurve();
+  });
+  return () => { el.value = fromValue(settings[key]); show(); };
+}
+const refreshers = [
+  bindRange('streamline', 'streamline', v => v / 100, v => Math.round(v * 100), pct),
+  bindRange('smoothing', 'smoothing', v => v / 100, v => Math.round(v * 100), pct),
+  bindRange('curve', 'curve', v => v / 100, v => Math.round(v * 100), curveLabel),
+  bindRange('minSize', 'minSize', v => v / 100, v => Math.round(v * 100), pct),
+];
+function bindCheck(id, key) {
+  const el = $(id);
+  el.checked = !!settings[key];
+  el.addEventListener('change', () => { settings[key] = el.checked; saveSettings(); syncPressureUI(); });
+  return () => { el.checked = !!settings[key]; };
+}
+refreshers.push(bindCheck('pressureOn', 'pressure'), bindCheck('penButtonErase', 'penButtonErase'));
+$('fingers').value = settings.fingers;
+$('fingers').addEventListener('change', (e) => { settings.fingers = e.target.value; saveSettings(); updateFingerNote(); });
+refreshers.push(() => { $('fingers').value = settings.fingers; });
+
+$('resetBrush').addEventListener('click', () => {
+  settings = Object.assign({}, DEFAULTS);
+  saveSettings();
+  refreshers.forEach(f => f());
+  syncPressureUI(); updateFingerNote();
+});
+
+function syncPressureUI() {
+  document.querySelectorAll('.needs-pressure').forEach(el =>
+    el.classList.toggle('disabled', !settings.pressure));
+  drawCurve();
+}
+
+// Pressure curve preview: x = pen pressure, y = resulting size.
+function drawCurve() {
+  const cv = $('curveCanvas');
+  if (!cv || panel.hidden) return;
+  const cssW = cv.clientWidth || 240, cssH = cv.clientHeight || 110;
+  const r = Math.max(1, window.devicePixelRatio || 1);
+  if (cv.width !== Math.round(cssW * r)) { cv.width = Math.round(cssW * r); cv.height = Math.round(cssH * r); }
+  const c = cv.getContext('2d');
+  c.setTransform(r, 0, 0, r, 0, 0);
+  const cs = getComputedStyle(document.documentElement);
+  const grid = cs.getPropertyValue('--border').trim();
+  const accent = cs.getPropertyValue('--accent').trim();
+  const muted = cs.getPropertyValue('--muted').trim();
+  c.clearRect(0, 0, cssW, cssH);
+  const pad = 8, W = cssW - pad * 2, H = cssH - pad * 2;
+  c.strokeStyle = grid; c.lineWidth = 1;
+  c.strokeRect(pad + 0.5, pad + 0.5, W, H);
+  c.beginPath();
+  for (let i = 1; i < 4; i++) {
+    c.moveTo(pad + (W * i) / 4, pad); c.lineTo(pad + (W * i) / 4, pad + H);
+    c.moveTo(pad, pad + (H * i) / 4); c.lineTo(pad + W, pad + (H * i) / 4);
+  }
+  c.stroke();
+  // size = minSize + (1 - minSize) * curve(pressure)
+  const min = settings.pressure ? settings.minSize : 1;
+  c.strokeStyle = settings.pressure ? accent : muted;
+  c.lineWidth = 2.5;
+  c.beginPath();
+  for (let i = 0; i <= 64; i++) {
+    const p = i / 64;
+    const s = min + (1 - min) * mapPressure(p, 'pen');
+    const x = pad + p * W, y = pad + H - s * H;
+    if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
+  }
+  c.stroke();
+  if (lastPenPressure != null && settings.pressure) {
+    const p = lastPenPressure;
+    const s = min + (1 - min) * mapPressure(p, 'pen');
+    c.fillStyle = accent;
+    c.beginPath(); c.arc(pad + p * W, pad + H - s * H, 4, 0, Math.PI * 2); c.fill();
+  }
+}
+
+let lastPenPressure = null;
+function showPressure(p) {
+  lastPenPressure = Math.min(1, Math.max(0, p || 0));
+  if (panel.hidden) return;
+  $('pressureNow').textContent = lastPenPressure.toFixed(2);
+  $('pressureBar').style.width = (lastPenPressure * 100).toFixed(0) + '%';
+  drawCurve();
+}
+
+function markPen() {
+  if (penSeen) return;
+  penSeen = true;
+  updateFingerNote();
+}
+function updateFingerNote() {
+  const note = $('fingerNote');
+  if (settings.fingers === 'auto') {
+    note.textContent = penSeen
+      ? 'Pen detected — fingers now pan & zoom.'
+      : 'Fingers draw until you use a pen, then switch to pan & zoom.';
+  } else {
+    note.textContent = settings.fingers === 'draw'
+      ? 'One finger draws; two fingers pan & zoom.'
+      : 'Fingers only pan & zoom. Draw with the pen or mouse.';
+  }
+}
+
+// -------------------------------------------------------------------------
+// keyboard, toast, hint
+// -------------------------------------------------------------------------
 window.addEventListener('keydown', (e) => {
-  if (e.target.tagName === 'INPUT') return;
-  if (e.code === 'Space') { spaceHeld = true; if (!drawing) canvas.style.cursor = 'grab'; return; }
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.code === 'Space') { spaceHeld = true; if (!stroke) canvas.style.cursor = 'grab'; return; }
   const mod = e.ctrlKey || e.metaKey;
   if (mod && e.key.toLowerCase() === 'z') {
     e.preventDefault();
-    if (e.shiftKey) { if (E.qs_redo()) { syncUndo(); invalidate(); } }
-    else { if (E.qs_undo()) { syncUndo(); invalidate(); } }
+    if (e.shiftKey) doRedo(false); else doUndo(false);
     return;
   }
-  if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); if (E.qs_redo()) { syncUndo(); invalidate(); } return; }
+  if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); doRedo(false); return; }
   if (mod) return;
   switch (e.key.toLowerCase()) {
     case 'p': selectTool('pen'); break;
     case 'e': selectTool('eraser'); break;
     case 'h': selectTool('pan'); break;
+    case 'b': panel.hidden ? openPanel() : closePanel(); break;
+    case '[': setWidth(width - 1); break;
+    case ']': setWidth(width + 1); break;
     case '+': case '=': zoomCenter(1.25); break;
     case '-': zoomCenter(0.8); break;
-    case '0': cam.x = 0; cam.y = 0; cam.scale = 1; updateZoomLabel(); invalidate(); break;
+    case '0': resetView(); break;
+    case 'escape': closePanel(); break;
   }
 });
 window.addEventListener('keyup', (e) => {
-  if (e.code === 'Space') { spaceHeld = false; if (!drawing && !panning) canvas.style.cursor = tool === 'pan' ? 'grab' : 'crosshair'; }
+  if (e.code === 'Space') { spaceHeld = false; if (!stroke && !mousePan) setCursor(); }
 });
 window.addEventListener('resize', resize);
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', readTheme);
+
+let toastTimer = null;
+function toast(msg) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 900);
+}
 
 let hintTimer = null;
 function hideHint() {
-  const h = document.getElementById('hint');
+  const h = $('hint');
   if (h && !h.classList.contains('gone')) h.classList.add('gone');
   clearTimeout(hintTimer);
 }
@@ -424,8 +768,8 @@ function hideHint() {
 // -------------------------------------------------------------------------
 async function boot() {
   const resp = await fetch(WASM_URL);
-  const bytes = await resp.arrayBuffer();
-  const module = await WebAssembly.compile(bytes);
+  if (!resp.ok) throw new Error('HTTP ' + resp.status + ' fetching ' + WASM_URL);
+  const module = await WebAssembly.compile(await resp.arrayBuffer());
   // Provide a stub for every import so instantiation can never fail, whatever
   // the toolchain happened to leave undefined.
   const env = {};
@@ -436,21 +780,28 @@ async function boot() {
   const instance = await WebAssembly.instantiate(module, { env });
   E = instance.exports;
   E.qs_init();
-  window.QSketch = E;   // exposed for automation / debugging (read-only engine)
+  window.QSketch = E;   // exposed for automation / debugging
+  window.QSketchView = { cam, get settings() { return settings; }, get penSeen() { return penSeen; } };
 
+  if (matchMedia('(pointer: coarse)').matches) {
+    $('hint').innerHTML = '<b>Pinch</b> to zoom · <b>two fingers</b> to pan · <b>2-finger tap</b> undo';
+  }
   buildSwatches();
   selectTool('pen');
+  setWidth(width);
+  readTheme();
   resize();
   updateZoomLabel();
   syncUndo();
-  document.getElementById('loading').classList.add('hidden');
+  syncPressureUI();
+  updateFingerNote();
+  $('loading').classList.add('hidden');
   requestAnimationFrame(frame);
-  hintTimer = setTimeout(hideHint, 7000);
+  hintTimer = setTimeout(hideHint, 8000);
 }
 
 boot().catch(err => {
   console.error(err);
-  const l = document.getElementById('loading');
-  l.innerHTML = '<p style="color:#e5484d">Failed to load the WASM engine.<br>' +
-                'Serve this folder over HTTP (not file://) and reload.</p>';
+  $('loading').innerHTML = '<p style="color:#e5484d">Failed to load the WASM engine.<br>' +
+                           'Serve this folder over HTTP (not file://) and reload.</p>';
 });

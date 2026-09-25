@@ -30,11 +30,12 @@
       <label class="color-pick" title="Custom color">
         <input type="color" id="colorInput" value="#1b1d23" />
       </label>
-      <label class="width" title="Stroke width">
+      <label class="width" title="Stroke size ( [ and ] )">
         <span class="wlabel">Size</span>
         <input type="range" id="widthInput" min="1" max="48" step="1" value="4" />
         <span class="wval" id="widthVal">4</span>
       </label>
+      <button id="brushBtn" title="Brush settings (B)" aria-haspopup="dialog" aria-expanded="false" aria-controls="brushPanel">⚙<span class="blabel">Brush</span></button>
     </div>
 
     <div class="group actions">
@@ -63,6 +64,72 @@
     <div id="hint" class="hint">
       Draw with a pen or mouse · <b>Scroll</b> to zoom · <b>Space + drag</b> or middle-drag to pan
     </div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <!-- Brush settings -->
+    <section id="brushPanel" class="panel" role="dialog" aria-label="Brush settings" hidden>
+      <header class="panel-head">
+        <h2>Brush</h2>
+        <button id="panelClose" class="icon" title="Close" aria-label="Close">✕</button>
+      </header>
+
+      <div class="panel-body">
+        <h3>Stabilization</h3>
+        <label class="row">
+          <span class="name">StreamLine <small>pulls the line behind the nib</small></span>
+          <input type="range" id="streamline" min="0" max="100" step="1" />
+          <output id="streamlineVal"></output>
+        </label>
+        <label class="row">
+          <span class="name">Smoothing <small>evens out the finished path</small></span>
+          <input type="range" id="smoothing" min="0" max="100" step="1" />
+          <output id="smoothingVal"></output>
+        </label>
+
+        <h3>Pressure</h3>
+        <label class="row check">
+          <span class="name">Pressure sensitivity <small>S Pen / stylus pressure changes size</small></span>
+          <input type="checkbox" id="pressureOn" />
+        </label>
+        <div class="needs-pressure">
+          <canvas id="curveCanvas" class="curve" aria-label="Pressure curve preview"></canvas>
+          <div class="axis"><span>light</span><span>pen pressure</span><span>heavy</span></div>
+          <label class="row">
+            <span class="name">Curve <small>soft = less force for thick lines</small></span>
+            <input type="range" id="curve" min="-100" max="100" step="1" />
+            <output id="curveVal"></output>
+          </label>
+          <label class="row">
+            <span class="name">Min size <small>size at the lightest touch</small></span>
+            <input type="range" id="minSize" min="0" max="100" step="1" />
+            <output id="minSizeVal"></output>
+          </label>
+          <div class="meter" title="Live pen pressure">
+            <span>Pen now</span>
+            <div class="bar"><div id="pressureBar"></div></div>
+            <output id="pressureNow">—</output>
+          </div>
+        </div>
+
+        <h3>Touch &amp; pen</h3>
+        <label class="row select">
+          <span class="name">Fingers</span>
+          <select id="fingers">
+            <option value="auto">Auto</option>
+            <option value="draw">Draw</option>
+            <option value="navigate">Pan &amp; zoom only</option>
+          </select>
+        </label>
+        <p class="note" id="fingerNote"></p>
+        <label class="row check">
+          <span class="name">Pen button erases <small>hold the S Pen side button</small></span>
+          <input type="checkbox" id="penButtonErase" />
+        </label>
+        <p class="note">Pinch to zoom · two fingers to pan · 2-finger tap undo · 3-finger tap redo</p>
+
+        <button id="resetBrush" class="reset">Reset to defaults</button>
+      </div>
+    </section>
   </main>
 </div>
 <script src="app.js"></script>

@@ -37,6 +37,9 @@ jobs:
       - name: Build the Nim -> WASM engine
         run: bash tools/build.sh
 
+      - name: Engine tests
+        run: node tests/engine.test.js
+
       - name: Assemble the static site
         run: |
           mkdir -p _site
