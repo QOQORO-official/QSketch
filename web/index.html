@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<meta name="theme-color" content="#1b1d23" />
+<title>QSketch — Nim · WebAssembly sketchpad</title>
+<meta name="description" content="A fast, infinite-canvas sketch & handwritten-notes app. Pressure-sensitive vector strokes, powered by a Nim engine compiled to WebAssembly. Inspired by Rnote." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%236c8cff'/%3E%3Cpath d='M7 22 L20 9 l3 3 L10 25 l-4 1 z' fill='%23fff'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div id="app">
+  <!-- Top toolbar -->
+  <header id="toolbar">
+    <div class="group brand">
+      <span class="logo" aria-hidden="true">✎</span>
+      <span class="title">QSketch</span>
+      <span class="tag">Nim · WASM</span>
+    </div>
+
+    <div class="group tools" role="toolbar" aria-label="Tools">
+      <button class="tool" data-tool="pen"    title="Pen (P)"    aria-pressed="true">✒️<span>Pen</span></button>
+      <button class="tool" data-tool="eraser" title="Eraser (E)" aria-pressed="false">🩹<span>Eraser</span></button>
+      <button class="tool" data-tool="pan"    title="Pan (H / hold Space)" aria-pressed="false">✋<span>Pan</span></button>
+    </div>
+
+    <div class="group pen-opts">
+      <div class="swatches" id="swatches" aria-label="Colors"></div>
+      <label class="color-pick" title="Custom color">
+        <input type="color" id="colorInput" value="#1b1d23" />
+      </label>
+      <label class="width" title="Stroke width">
+        <span class="wlabel">Size</span>
+        <input type="range" id="widthInput" min="1" max="48" step="1" value="4" />
+        <span class="wval" id="widthVal">4</span>
+      </label>
+    </div>
+
+    <div class="group actions">
+      <button id="undoBtn"  title="Undo (Ctrl+Z)" disabled>↶</button>
+      <button id="redoBtn"  title="Redo (Ctrl+Shift+Z)" disabled>↷</button>
+      <button id="clearBtn" title="Clear canvas">🗑</button>
+      <span class="sep"></span>
+      <button id="zoomOut" title="Zoom out (−)">−</button>
+      <button id="zoomFit" title="Reset view (0)"><span id="zoomVal">100%</span></button>
+      <button id="zoomIn"  title="Zoom in (+)">+</button>
+      <span class="sep"></span>
+      <button id="saveBtn"   title="Save .qsketch">Save</button>
+      <button id="openBtn"   title="Open .qsketch">Open</button>
+      <button id="pngBtn"    title="Export PNG">PNG</button>
+      <input type="file" id="fileInput" accept=".qsketch,application/octet-stream" hidden />
+    </div>
+  </header>
+
+  <!-- Canvas -->
+  <main id="stage">
+    <canvas id="canvas"></canvas>
+    <div id="loading" class="overlay">
+      <div class="spinner"></div>
+      <p>Loading Nim → WebAssembly engine…</p>
+    </div>
+    <div id="hint" class="hint">
+      Draw with a pen or mouse · <b>Scroll</b> to zoom · <b>Space + drag</b> or middle-drag to pan
+    </div>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

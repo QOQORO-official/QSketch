@@ -1,0 +1,6 @@
+# build scratch
+build/.cache/
+build/.nimcache/
+_site/
+node_modules/
+*.log

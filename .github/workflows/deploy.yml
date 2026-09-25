@@ -1,0 +1,59 @@
+name: Build & deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one concurrent deploy; let an in-progress run finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM wasm toolchain (clang + wasm-ld + binaryen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lld clang binaryen
+          echo "clang: $(clang --version | head -1)"
+          echo "wasm-ld: $(wasm-ld --version)"
+
+      - name: Cache Nim compiler
+        uses: actions/cache@v4
+        with:
+          path: build/.cache
+          key: nim-2.0.14-linux-x64
+
+      - name: Build the Nim -> WASM engine
+        run: bash tools/build.sh
+
+      - name: Assemble the static site
+        run: |
+          mkdir -p _site
+          cp web/index.html web/styles.css web/app.js web/qsketch.wasm _site/
+          # Jekyll would otherwise ignore files it doesn't understand.
+          touch _site/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
