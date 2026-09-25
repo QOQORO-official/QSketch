@@ -101,10 +101,11 @@ func canUndo*(d: Document): bool = d.undoStack.len > 0
 func canRedo*(d: Document): bool = d.redoStack.len > 0
 
 # --------------------------------------------------------------------------
-# Binary serialization: "QSK2" + strokes as stabilised samples so they can be
+# Binary serialization: "QSK3" + strokes as stabilised samples so they can be
 # re-tessellated identically on load. Little-endian, packed. Per stroke:
-#   u32 color, f32 baseWidth, f32 minRatio, f32 smoothing, u32 n, n*(x,y,p)
-# "QSK1" files (no minRatio/smoothing) still load with the old defaults.
+#   u32 color, f32 baseWidth, f32 minRatio, f32 smoothing,
+#   u32 kind, f32 nibX, f32 nibY, f32 nibRatio, u32 n, n*(x,y,p)
+# "QSK2" (no tip fields) and "QSK1" (no minRatio/smoothing either) still load.
 # --------------------------------------------------------------------------
 
 proc putU32(b: var seq[byte], v: uint32) =
@@ -125,7 +126,7 @@ proc getF32(b: seq[byte], o: var int): float32 =
   cast[float32](getU32(b, o))
 
 proc serialize*(d: Document): seq[byte] =
-  result.add byte('Q'); result.add byte('S'); result.add byte('K'); result.add byte('2')
+  result.add byte('Q'); result.add byte('S'); result.add byte('K'); result.add byte('3')
   var alive: seq[int]
   for i in 0 ..< d.strokes.len:
     if d.strokes[i].alive: alive.add i
@@ -136,6 +137,10 @@ proc serialize*(d: Document): seq[byte] =
     putF32(result, s.baseWidth)
     putF32(result, s.minRatio)
     putF32(result, s.smoothing)
+    putU32(result, uint32(ord(s.kind)))
+    putF32(result, s.nibDir.x)
+    putF32(result, s.nibDir.y)
+    putF32(result, s.nibRatio)
     putU32(result, uint32(s.raw.len))
     for smp in s.raw:
       putF32(result, smp.pos.x)
@@ -146,8 +151,9 @@ proc deserialize*(d: var Document, b: seq[byte]): bool =
   if b.len < 8: return false
   if b[0] != byte('Q') or b[1] != byte('S') or b[2] != byte('K'): return false
   let version = b[3]
-  if version != byte('1') and version != byte('2'): return false
-  let perStroke = if version == byte('2'): 20 else: 12   # header bytes
+  if version < byte('1') or version > byte('3'): return false
+  let perStroke =                                      # header bytes
+    if version == byte('3'): 36 elif version == byte('2'): 20 else: 12
   # Validate the whole buffer before touching the document, so a truncated
   # or corrupt file leaves the current drawing intact.
   var o = 4
@@ -171,11 +177,21 @@ proc deserialize*(d: var Document, b: seq[byte]): bool =
     let bw = getF32(b, o)
     var minRatio = DefaultMinRatio
     var smoothing = 0'f32
-    if version == byte('2'):
+    var kind = bkRound
+    var nibDir = vec2(0.70710678'f32, -0.70710678'f32)
+    var nibRatio = DefaultNibRatio
+    if version >= byte('2'):
       minRatio = getF32(b, o)
       smoothing = getF32(b, o)
+    if version >= byte('3'):
+      let k = getU32(b, o)
+      if k == uint32(ord(bkNib)): kind = bkNib
+      let nx = getF32(b, o)
+      let ny = getF32(b, o)
+      nibDir = vec2(nx, ny)
+      nibRatio = getF32(b, o)
     let ns = int(getU32(b, o))
-    var s = newStroke(color, bw, minRatio, smoothing)
+    var s = newStroke(color, bw, minRatio, smoothing, 0'f32, kind, nibDir, nibRatio)
     for _ in 0 ..< ns:
       let x = getF32(b, o)
       let y = getF32(b, o)

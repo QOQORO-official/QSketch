@@ -16,7 +16,8 @@
 'use strict';
 
 const WASM_URL = 'qsketch.wasm';
-const SETTINGS_KEY = 'qsketch.brush.v1';
+const SETTINGS_KEY = 'qsketch.brush.v2';
+const LEGACY_SETTINGS_KEY = 'qsketch.brush.v1';
 
 let E = null;                              // wasm exports
 
@@ -38,27 +39,74 @@ function zoomAbout(sx, sy, factor) {
   viewChanged();
 }
 
-// ---- brush settings (persisted per browser) ----
-const DEFAULTS = Object.freeze({
-  streamline: 0.30,      // 0..1  time-based pull on the nib
-  smoothing: 0.35,       // 0..1  moving average of the stroke path
-  pressure: true,        // pen pressure drives width
-  curve: 0,              // -1 soft .. +1 firm  (gamma = 3^curve)
-  minSize: 0.20,         // width at zero pressure, fraction of Size
-  fingers: 'auto',       // 'auto' | 'draw' | 'navigate'
-  penButtonErase: true,  // S Pen / stylus barrel button = eraser
-});
+// ---- brushes ----
+// kind 0 = round tip, 1 = flat calligraphy nib. Everything else is a
+// per-brush default the user can tune (and that we remember per brush).
+const TIP_ROUND = 0, TIP_NIB = 1;
+const NIB_RATIO = 0.15;                 // nib thickness relative to its width
+const BRUSHES = [
+  { id: 'ballpoint',   name: 'Ballpoint',    icon: '🖊️', kind: TIP_ROUND,
+    size: 3,  minSize: 0.70, streamline: 0.15, smoothing: 0.20, opacity: 1 },
+  { id: 'fountain',    name: 'Fountain pen', icon: '✒️', kind: TIP_ROUND,
+    size: 5,  minSize: 0.20, streamline: 0.30, smoothing: 0.35, opacity: 1 },
+  { id: 'calligraphy', name: 'Calligraphy',  icon: '🖋️', kind: TIP_NIB,
+    size: 14, minSize: 0.45, streamline: 0.35, smoothing: 0.40, opacity: 1, nibAngle: 45 },
+  { id: 'marker',      name: 'Marker',       icon: '🖍️', kind: TIP_ROUND,
+    size: 18, minSize: 0.85, streamline: 0.25, smoothing: 0.30, opacity: 0.55 },
+];
+const BRUSH_PARAMS = ['size', 'minSize', 'streamline', 'smoothing', 'opacity', 'nibAngle'];
+
+function brushDefaults(def) {
+  const out = {};
+  for (const k of BRUSH_PARAMS) if (def[k] !== undefined) out[k] = def[k];
+  return out;
+}
+function defaultSettings() {
+  return {
+    brush: 'fountain',
+    brushes: Object.fromEntries(BRUSHES.map(b => [b.id, brushDefaults(b)])),
+    eraserSize: 24,        // screen pixels
+    pressure: true,        // pen pressure drives width
+    curve: 0,              // -1 soft .. +1 firm  (gamma = 3^curve)
+    fingers: 'auto',       // 'auto' | 'draw' | 'navigate'
+    penButtonErase: true,  // S Pen / stylus barrel button = eraser
+  };
+}
 let settings = loadSettings();
 
 function loadSettings() {
+  const s = defaultSettings();
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) return Object.assign({}, DEFAULTS, JSON.parse(raw));
+    if (raw) {
+      const saved = JSON.parse(raw);
+      for (const k of ['brush', 'eraserSize', 'pressure', 'curve', 'fingers', 'penButtonErase'])
+        if (saved[k] !== undefined) s[k] = saved[k];
+      for (const b of BRUSHES) Object.assign(s.brushes[b.id], (saved.brushes || {})[b.id]);
+      if (!BRUSHES.some(b => b.id === s.brush)) s.brush = 'fountain';
+      return s;
+    }
+    // v1 had one global brush: keep the user's tuning on the fountain pen
+    const legacy = localStorage.getItem(LEGACY_SETTINGS_KEY);
+    if (legacy) {
+      const v1 = JSON.parse(legacy);
+      for (const k of ['pressure', 'curve', 'fingers', 'penButtonErase'])
+        if (v1[k] !== undefined) s[k] = v1[k];
+      for (const k of ['streamline', 'smoothing', 'minSize'])
+        if (v1[k] !== undefined) s.brushes.fountain[k] = v1[k];
+    }
   } catch (_) { /* private mode / blocked storage */ }
-  return Object.assign({}, DEFAULTS);
+  return s;
 }
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch (_) {}
+}
+const brushDef = () => BRUSHES.find(b => b.id === settings.brush) || BRUSHES[1];
+const brushParams = () => settings.brushes[brushDef().id];
+function nibVector(deg) {
+  // angle of the nib edge, counter-clockwise from horizontal (screen y is down)
+  const a = deg * Math.PI / 180;
+  return [Math.cos(a), -Math.sin(a)];
 }
 
 // Map raw stylus pressure through the user's curve. Non-pen input (mouse,
@@ -72,7 +120,6 @@ function mapPressure(p, pointerType) {
 // ---- tool state ----
 let tool = 'pen';
 let color = '#1b1d23';
-let width = 4;
 let dpr = Math.max(1, window.devicePixelRatio || 1);
 let penSeen = false;               // a stylus has been used on this page
 
@@ -86,9 +133,10 @@ let layerDirty = true;
 let needsRedraw = true;
 
 const pathCache = new Map();       // stroke id -> {path, css}
+let liveDirty = false;             // engine has new samples to tessellate
+
 let livePath = null;               // Path2D of the in-progress stroke
 let liveCss = '';
-let liveDirty = false;             // engine has new samples to tessellate
 
 // ---- input state ----
 let stroke = null;                 // {id, type, erase, started}
@@ -101,12 +149,13 @@ let tap = null;                    // {t, max, moved} multi-finger tap tracking
 // -------------------------------------------------------------------------
 // colour + theme helpers
 // -------------------------------------------------------------------------
-function hexToRGBA(hex) {              // "#rrggbb" -> 0xRRGGBBAA (>>>0)
+function hexToRGBA(hex, alpha = 1) {   // "#rrggbb" -> 0xRRGGBBAA (>>>0)
   const h = hex.replace('#', '');
   const r = parseInt(h.slice(0, 2), 16);
   const g = parseInt(h.slice(2, 4), 16);
   const b = parseInt(h.slice(4, 6), 16);
-  return (((r << 24) | (g << 16) | (b << 8) | 0xff) >>> 0);
+  const a = Math.round(Math.min(1, Math.max(0, alpha)) * 255);
+  return (((r << 24) | (g << 16) | (b << 8) | a) >>> 0);
 }
 function rgbaToCss(v) {                 // 0xRRGGBBAA -> css
   const r = (v >>> 24) & 0xff, g = (v >>> 16) & 0xff, b = (v >>> 8) & 0xff, a = v & 0xff;
@@ -125,14 +174,29 @@ function readTheme() {
 // -------------------------------------------------------------------------
 // building Path2D from an engine outline buffer (world coords)
 // -------------------------------------------------------------------------
+// The engine emits a list of convex pieces, [n, x0, y0, ..., x(n-1), y(n-1)]*,
+// all wound the same way: filled together (nonzero) they form the stroke.
 function outlineToPath(ptr, count) {
   const p = new Path2D();
-  if (!ptr || count < 4) return p;
+  if (!ptr || count < 7) return p;
   const a = f32(ptr, count);
-  p.moveTo(a[0], a[1]);
-  for (let i = 2; i < count; i += 2) p.lineTo(a[i], a[i + 1]);
-  p.closePath();
+  for (let i = 0; i < count;) {
+    const n = a[i++];
+    if (n < 3 || i + 2 * n > count) break;
+    p.moveTo(a[i], a[i + 1]);
+    for (let k = 1; k < n; k++) p.lineTo(a[i + 2 * k], a[i + 2 * k + 1]);
+    p.closePath();
+    i += 2 * n;
+  }
   return p;
+}
+function forEachOutlinePoint(ptr, count, fn) {
+  if (!ptr) return;
+  const a = f32(ptr, count);
+  for (let i = 0; i < count;) {
+    const n = a[i++];
+    for (let k = 0; k < n; k++, i += 2) fn(a[i], a[i + 1]);
+  }
 }
 
 function getCommittedPath(id) {
@@ -190,18 +254,35 @@ function renderLayer() {
   }
 }
 
+function setWorldTransform(c) {
+  c.setTransform(cam.scale * dpr, 0, 0, cam.scale * dpr, cam.x * dpr, cam.y * dpr);
+}
+
 function render() {
   if (layerDirty) { layerDirty = false; renderLayer(); }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.drawImage(layer, 0, 0);
   if (livePath) {
-    ctx.setTransform(cam.scale * dpr, 0, 0, cam.scale * dpr, cam.x * dpr, cam.y * dpr);
+    // One closed outline per stroke: filling it directly is exact, even for
+    // translucent ink, and matches the committed stroke pixel for pixel.
+    setWorldTransform(ctx);
     ctx.fillStyle = liveCss;
     ctx.fill(livePath);
   }
 }
 
+// Time spent per frame on stroke work + painting (last 240 frames that did work).
+const frameTimes = [];
+function frameStats() {
+  if (!frameTimes.length) return null;
+  const v = frameTimes.slice().sort((a, b) => a - b);
+  const pick = (q) => v[Math.min(v.length - 1, Math.floor(q * v.length))];
+  return { frames: v.length, avg: v.reduce((a, b) => a + b, 0) / v.length, p95: pick(0.95), max: v[v.length - 1] };
+}
+
 function frame() {
+  const t0 = performance.now();
+  let worked = false;
   if (liveDirty) {
     // Tessellate once per frame no matter how many samples arrived.
     liveDirty = false;
@@ -209,7 +290,11 @@ function frame() {
     livePath = outlineToPath(E.qs_live_outline_ptr(), E.qs_live_outline_count());
     needsRedraw = true;
   }
-  if (needsRedraw) { needsRedraw = false; render(); }
+  if (needsRedraw) { needsRedraw = false; render(); worked = true; }
+  if (worked) {
+    frameTimes.push(performance.now() - t0);
+    if (frameTimes.length > 240) frameTimes.shift();
+  }
   requestAnimationFrame(frame);
 }
 
@@ -241,9 +326,12 @@ function beginStroke(ev, erase) {
     eraseWith(ev);
     return;
   }
-  const rgba = hexToRGBA(color);
-  const minSize = settings.pressure ? settings.minSize : 1;
-  E.qs_begin_stroke(rgba, width, minSize, settings.smoothing, settings.streamline);
+  const def = brushDef(), bp = brushParams();
+  const rgba = hexToRGBA(color, bp.opacity);
+  const minSize = settings.pressure ? bp.minSize : 1;
+  const [nx, ny] = nibVector(bp.nibAngle ?? 45);
+  E.qs_begin_stroke(rgba, bp.size, minSize, bp.smoothing, bp.streamline,
+                    def.kind, nx, ny, NIB_RATIO);
   liveCss = rgbaToCss(rgba);
   feedStroke(ev);
 }
@@ -259,7 +347,7 @@ function feedStroke(ev) {
 }
 
 function eraseWith(ev) {
-  const radius = Math.max(8, width * 1.5) / cam.scale;
+  const radius = (settings.eraserSize / 2) / cam.scale;   // size is in screen px
   let removed = 0;
   for (const e of samplesOf(ev)) {
     const p = localXY(e);
@@ -276,9 +364,16 @@ function endStroke() {
   if (s.erase) { E.qs_erase_end(); syncUndo(); return; }
   const id = E.qs_commit_stroke();
   livePath = null; liveDirty = false;
-  if (id >= 0) getCommittedPath(id);
+  if (id >= 0) {
+    const entry = getCommittedPath(id);
+    if (!layerDirty) {                     // camera unchanged: just add it
+      setWorldTransform(lctx);
+      lctx.fillStyle = entry.css;
+      lctx.fill(entry.path);
+    }
+  }
   syncUndo();
-  viewChanged();
+  needsRedraw = true;
 }
 
 function cancelStroke() {
@@ -286,6 +381,7 @@ function cancelStroke() {
   if (stroke.erase) E.qs_erase_end(); else E.qs_cancel_stroke();
   stroke = null;
   livePath = null; liveDirty = false;
+  needsRedraw = true;
   syncUndo();
   invalidate();
 }
@@ -389,6 +485,7 @@ function touchUp(ev) {
 canvas.addEventListener('pointerdown', (ev) => {
   hideHint();
   closePanel();
+  closeBrushMenu();
   if (ev.pointerType === 'touch') { touchDown(ev); return; }
 
   if (ev.pointerType === 'pen') {
@@ -486,11 +583,103 @@ function selectTool(t) {
   document.querySelectorAll('.tool').forEach(b =>
     b.setAttribute('aria-pressed', String(b.dataset.tool === t)));
   setCursor();
+  showSize();
 }
-function setWidth(w) {
-  width = Math.max(1, Math.min(48, Math.round(w)));
-  $('widthInput').value = width;
-  $('widthVal').textContent = width;
+// The Size slider edits whatever is active: the eraser, or the current brush.
+const currentSize = () => (tool === 'eraser' ? settings.eraserSize : brushParams().size);
+function showSize() {
+  const v = currentSize();
+  $('widthInput').value = v;
+  $('widthVal').textContent = v;
+  $('widthInput').closest('label').title =
+    (tool === 'eraser' ? 'Eraser size' : brushDef().name + ' size') + ' ( [ and ] )';
+}
+function setSize(w) {
+  const v = Math.max(1, Math.min(48, Math.round(w)));
+  if (tool === 'eraser') settings.eraserSize = v; else brushParams().size = v;
+  saveSettings();
+  showSize();
+}
+
+// ---- brush picker ----
+const brushMenu = $('brushMenu');
+function selectBrush(id) {
+  if (!BRUSHES.some(b => b.id === id)) return;
+  settings.brush = id;
+  saveSettings();
+  selectTool('pen');
+  syncBrushUI();
+  closeBrushMenu();
+}
+function syncBrushUI() {
+  const def = brushDef();
+  $('penIcon').textContent = def.icon;
+  $('penName').textContent = def.name;
+  $('brushSectionTitle').textContent = def.name;
+  document.querySelectorAll('.nib-only').forEach(el => { el.hidden = def.kind !== TIP_NIB; });
+  document.querySelectorAll('.brush-item').forEach(el =>
+    el.setAttribute('aria-pressed', String(el.dataset.brush === def.id)));
+  refreshers.forEach(f => f());
+  showSize();
+  drawCurve();
+}
+function buildBrushMenu() {
+  const list = $('brushList');
+  for (const b of BRUSHES) {
+    const item = document.createElement('button');
+    item.className = 'brush-item';
+    item.dataset.brush = b.id;
+    item.innerHTML = `<span class="bi-icon">${b.icon}</span><span class="bi-name">${b.name}</span>` +
+                     `<canvas class="bi-preview" aria-hidden="true"></canvas>`;
+    item.addEventListener('click', () => selectBrush(b.id));
+    list.appendChild(item);
+  }
+}
+function openBrushMenu() {
+  closePanel();
+  brushMenu.hidden = false;
+  $('penTool').setAttribute('aria-expanded', 'true');
+  renderBrushPreviews();
+}
+function closeBrushMenu() {
+  if (brushMenu.hidden) return;
+  brushMenu.hidden = true;
+  $('penTool').setAttribute('aria-expanded', 'false');
+}
+// Draw a sample stroke with every brush using the real engine, through the
+// live-stroke API (begin -> points -> update -> cancel), so the document and
+// undo history are never touched.
+function renderBrushPreviews() {
+  if (stroke) return;
+  const ink = getComputedStyle(document.documentElement).getPropertyValue('--ink').trim() || '#000';
+  const r = Math.max(1, window.devicePixelRatio || 1);
+  document.querySelectorAll('.brush-item').forEach(item => {
+    const def = BRUSHES.find(b => b.id === item.dataset.brush);
+    const bp = settings.brushes[def.id];
+    const cv = item.querySelector('canvas');
+    const W = cv.clientWidth || 200, H = cv.clientHeight || 44;
+    cv.width = Math.round(W * r); cv.height = Math.round(H * r);
+    const c = cv.getContext('2d');
+    c.setTransform(r, 0, 0, r, 0, 0);
+    c.clearRect(0, 0, W, H);
+    const size = Math.min(bp.size, H * 0.5);          // keep fat brushes inside the box
+    const amp = Math.max(2, H / 2 - size / 2 - 4);
+    const [nx, ny] = nibVector(bp.nibAngle ?? 45);
+    E.qs_begin_stroke(hexToRGBA('#000000', 1), size, settings.pressure ? bp.minSize : 1,
+                      0, 0, def.kind, nx, ny, NIB_RATIO);
+    const N = 48;
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      const press = settings.pressure ? mapPressure(0.15 + 0.85 * Math.sin(Math.PI * t), 'pen') : 1;
+      E.qs_add_point(size / 2 + 6 + t * (W - size - 12), H / 2 - Math.sin(t * Math.PI * 2) * amp, press, i * 8);
+    }
+    E.qs_live_update();
+    const path = outlineToPath(E.qs_live_outline_ptr(), E.qs_live_outline_count());
+    E.qs_cancel_stroke();
+    c.globalAlpha = bp.opacity;
+    c.fillStyle = ink;
+    c.fill(path);
+  });
 }
 function updateZoomLabel() {
   $('zoomVal').textContent = Math.round(cam.scale * 100) + '%';
@@ -512,9 +701,16 @@ function resetView() {
 function zoomCenter(f) { zoomAbout(canvas.clientWidth / 2, canvas.clientHeight / 2, f); }
 
 document.querySelectorAll('.tool').forEach(b =>
-  b.addEventListener('click', () => selectTool(b.dataset.tool)));
+  b.addEventListener('click', () => {
+    if (b.dataset.tool === 'pen' && tool === 'pen') {
+      brushMenu.hidden ? openBrushMenu() : closeBrushMenu();
+      return;
+    }
+    closeBrushMenu();
+    selectTool(b.dataset.tool);
+  }));
 $('colorInput').addEventListener('input', (e) => setColor(e.target.value, null));
-$('widthInput').addEventListener('input', (e) => setWidth(parseInt(e.target.value, 10)));
+$('widthInput').addEventListener('input', (e) => setSize(parseInt(e.target.value, 10)));
 $('undoBtn').addEventListener('click', () => doUndo(false));
 $('redoBtn').addEventListener('click', () => doRedo(false));
 $('clearBtn').addEventListener('click', () => {
@@ -560,12 +756,11 @@ function exportPNG() {
   for (let id = 0; id < n; id++) {
     if (!E.qs_stroke_alive(id)) continue;
     const ptr = E.qs_stroke_outline_ptr(id), cnt = E.qs_stroke_outline_count(id);
-    if (!ptr || cnt < 2) continue;
-    const a = f32(ptr, cnt);
-    for (let i = 0; i < cnt; i += 2) {
-      if (a[i] < minx) minx = a[i]; if (a[i] > maxx) maxx = a[i];
-      if (a[i + 1] < miny) miny = a[i + 1]; if (a[i + 1] > maxy) maxy = a[i + 1];
-    }
+    if (!ptr || cnt < 7) continue;
+    forEachOutlinePoint(ptr, cnt, (x, y) => {
+      if (x < minx) minx = x; if (x > maxx) maxx = x;
+      if (y < miny) miny = y; if (y > maxy) maxy = y;
+    });
     any = true;
   }
   if (!any) { alert('Nothing to export yet — draw something first.'); return; }
@@ -589,6 +784,7 @@ function exportPNG() {
 // -------------------------------------------------------------------------
 const panel = $('brushPanel');
 function openPanel() {
+  closeBrushMenu();
   panel.hidden = false;
   $('brushBtn').setAttribute('aria-expanded', 'true');
   if (lastPenPressure != null) showPressure(lastPenPressure); else drawCurve();
@@ -603,22 +799,27 @@ function curveLabel(c) {
   return (c < 0 ? 'Soft ' : 'Firm ') + Math.round(Math.abs(c) * 100) + '%';
 }
 
-function bindRange(id, key, toValue, fromValue, label) {
+// Bind a slider to a value through get/set; `scale` maps value -> slider units.
+function bindRange(id, get, set, label, scale = 100) {
   const el = $(id), out = $(id + 'Val');
-  const show = () => { out.textContent = label(settings[key]); };
-  el.value = fromValue(settings[key]);
-  show();
+  const show = () => { el.value = Math.round(get() * scale); out.textContent = label(get()); };
   el.addEventListener('input', () => {
-    settings[key] = toValue(parseFloat(el.value));
-    show(); saveSettings(); drawCurve();
+    set(parseFloat(el.value) / scale);
+    out.textContent = label(get());
+    saveSettings(); drawCurve();
   });
-  return () => { el.value = fromValue(settings[key]); show(); };
+  show();
+  return show;
 }
+const bp = () => brushParams();
 const refreshers = [
-  bindRange('streamline', 'streamline', v => v / 100, v => Math.round(v * 100), pct),
-  bindRange('smoothing', 'smoothing', v => v / 100, v => Math.round(v * 100), pct),
-  bindRange('curve', 'curve', v => v / 100, v => Math.round(v * 100), curveLabel),
-  bindRange('minSize', 'minSize', v => v / 100, v => Math.round(v * 100), pct),
+  bindRange('streamline', () => bp().streamline, v => { bp().streamline = v; }, pct),
+  bindRange('smoothing', () => bp().smoothing, v => { bp().smoothing = v; }, pct),
+  bindRange('opacity', () => bp().opacity, v => { bp().opacity = Math.max(0.05, v); }, pct),
+  bindRange('nibAngle', () => bp().nibAngle ?? 45, v => { bp().nibAngle = v; },
+            v => Math.round(v) + '°', 1),
+  bindRange('minSize', () => bp().minSize, v => { bp().minSize = v; }, pct),
+  bindRange('curve', () => settings.curve, v => { settings.curve = v; }, curveLabel),
 ];
 function bindCheck(id, key) {
   const el = $(id);
@@ -632,9 +833,11 @@ $('fingers').addEventListener('change', (e) => { settings.fingers = e.target.val
 refreshers.push(() => { $('fingers').value = settings.fingers; });
 
 $('resetBrush').addEventListener('click', () => {
-  settings = Object.assign({}, DEFAULTS);
+  const brush = settings.brush;
+  settings = defaultSettings();
+  settings.brush = brush;
   saveSettings();
-  refreshers.forEach(f => f());
+  syncBrushUI();
   syncPressureUI(); updateFingerNote();
 });
 
@@ -668,7 +871,7 @@ function drawCurve() {
   }
   c.stroke();
   // size = minSize + (1 - minSize) * curve(pressure)
-  const min = settings.pressure ? settings.minSize : 1;
+  const min = settings.pressure ? brushParams().minSize : 1;
   c.strokeStyle = settings.pressure ? accent : muted;
   c.lineWidth = 2.5;
   c.beginPath();
@@ -733,12 +936,13 @@ window.addEventListener('keydown', (e) => {
     case 'e': selectTool('eraser'); break;
     case 'h': selectTool('pan'); break;
     case 'b': panel.hidden ? openPanel() : closePanel(); break;
-    case '[': setWidth(width - 1); break;
-    case ']': setWidth(width + 1); break;
+    case '[': setSize(currentSize() - 1); break;
+    case ']': setSize(currentSize() + 1); break;
+    case '1': case '2': case '3': case '4': selectBrush(BRUSHES[+e.key - 1].id); break;
     case '+': case '=': zoomCenter(1.25); break;
     case '-': zoomCenter(0.8); break;
     case '0': resetView(); break;
-    case 'escape': closePanel(); break;
+    case 'escape': closePanel(); closeBrushMenu(); break;
   }
 });
 window.addEventListener('keyup', (e) => {
@@ -781,14 +985,16 @@ async function boot() {
   E = instance.exports;
   E.qs_init();
   window.QSketch = E;   // exposed for automation / debugging
-  window.QSketchView = { cam, get settings() { return settings; }, get penSeen() { return penSeen; } };
+  window.QSketchView = { cam, frameStats, resetFrameStats: () => { frameTimes.length = 0; },
+                         get settings() { return settings; }, get penSeen() { return penSeen; } };
 
   if (matchMedia('(pointer: coarse)').matches) {
     $('hint').innerHTML = '<b>Pinch</b> to zoom · <b>two fingers</b> to pan · <b>2-finger tap</b> undo';
   }
   buildSwatches();
+  buildBrushMenu();
   selectTool('pen');
-  setWidth(width);
+  syncBrushUI();
   readTheme();
   resize();
   updateZoomLabel();

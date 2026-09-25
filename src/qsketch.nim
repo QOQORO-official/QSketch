@@ -37,10 +37,15 @@ proc qs_alloc(n: int32): pointer {.wexport.} =
 # --------------------------------------------------------------------------
 
 proc qs_begin_stroke(color: uint32, baseWidth, minRatio, smoothing,
-                     streamline: float32) {.wexport.} =
+                     streamline: float32, kind: int32,
+                     nibX, nibY, nibRatio: float32) {.wexport.} =
   ## Start a stroke. `minRatio` is the width at zero pressure relative to
   ## `baseWidth`; `smoothing` and `streamline` are 0..1 stabiliser strengths.
-  live = newStroke(color, baseWidth, minRatio, smoothing, streamline)
+  ## `kind` 0 = round tip, 1 = flat calligraphy nib along (nibX, nibY) with
+  ## thickness `nibRatio` * baseWidth.
+  let k = if kind == int32(ord(bkNib)): bkNib else: bkRound
+  live = newStroke(color, baseWidth, minRatio, smoothing, streamline,
+                   k, vec2(nibX, nibY), nibRatio)
   drawing = true
 
 proc qs_add_point(x, y, pressure, timeMs: float32) {.wexport.} =

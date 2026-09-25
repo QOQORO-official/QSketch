@@ -1,6 +1,21 @@
-## Stroke model: turns raw pressure-tagged input samples into a smooth,
-## variable-width filled outline (the same visual language as Rnote's brush
-## strokes). All heavy geometry lives here so it runs as compiled wasm.
+## Stroke model: turns raw pressure-tagged input samples into filled vector
+## geometry. All heavy geometry lives here so it runs as compiled wasm.
+##
+## Rendering is a true sweep of the pen tip along the smoothed path, emitted
+## as ONE closed outline per stroke (the way vector stroker libraries do it):
+## the left edge forward, around the end cap, the right edge back, around the
+## start cap. On the outside of a turn the outline follows the tip's own
+## shape; on the inside it routes through the turn's centre, which keeps the
+## nonzero fill solid there. One contour means no internal edges, so there is
+## nothing for the browser's anti-aliasing to leave seams on, translucent ink
+## stays even where a stroke crosses itself, and it is cheap to redraw.
+##
+## The tip is a convex polygon, scaled per sample by pressure:
+##
+## * round -- a 64-gon disc whose radius follows pressure (ballpoint, fountain
+##   pen and marker differ only in size / pressure response / opacity)
+## * nib   -- a flat, angled calligraphy nib (a thin rectangle): thick or thin
+##   depending on the direction of travel relative to the nib
 ##
 ## Input goes through two Procreate-style stabilisers:
 ##
@@ -19,10 +34,15 @@ type
     pos*: Vec2
     pressure*: float32
 
+  BrushKind* = enum
+    bkRound = 0   ## disc tip
+    bkNib = 1     ## flat broad-edge nib
+
   Stroke* = object
     ## Stabilised samples in world space (kept for re-tessellation / save).
     raw*: seq[InputSample]
-    ## Flattened outline polygon: x0,y0,x1,y1, ... ready for Canvas2D fill.
+    ## Fill geometry as a list of polygons, each encoded as
+    ## [n, x0, y0, ..., x(n-1), y(n-1)]. Filled together with the nonzero rule.
     outline*: seq[float32]
     ## Sampled centerline for cheap hit testing (eraser / selection).
     centerline*: seq[Vec2]
@@ -30,6 +50,9 @@ type
     baseWidth*: float32     ## nominal (max) diameter in world units
     minRatio*: float32      ## width at zero pressure, relative to baseWidth
     smoothing*: float32     ## 0..1 moving-average strength
+    kind*: BrushKind
+    nibDir*: Vec2           ## unit vector along the nib edge (bkNib)
+    nibRatio*: float32      ## nib thickness relative to baseWidth (bkNib)
     bbox*: Aabb
     alive*: bool
     # --- capture-only state (not serialized) ---
@@ -43,11 +66,11 @@ type
 
 const
   DefaultMinRatio* = 0.35'f32
-  CapSteps = 7                  ## semicircle segments for round caps
-  # Fixed rotation step for round caps (PI / CapSteps) precomputed so we
-  # never need a runtime trig call inside wasm.
-  CapCos = 0.9009688679'f32     ## cos(PI/7)
-  CapSin = 0.4338837391'f32     ## sin(PI/7)
+  DefaultNibRatio* = 0.15'f32
+  CircleSegs = 64               ## resolution of the unit-circle table
+  # cos/sin of 2*PI/CircleSegs, so the table is built without libm.
+  StepCos = 0.99518472667219688
+  StepSin = 0.09801714032956060
   MaxSmoothRadius = 10          ## samples each side at smoothing = 1
   CatchUpStepMs = 8.0'f32       ## simulated frame length when easing to pen-lift
   CatchUpMaxSteps = 90
@@ -69,10 +92,16 @@ func streamlineTau*(streamline: float32): float32 =
 
 func newStroke*(color: uint32, baseWidth: float32,
                 minRatio = DefaultMinRatio, smoothing = 0'f32,
-                streamline = 0'f32): Stroke =
+                streamline = 0'f32, kind = bkRound,
+                nibDir = vec2(0.70710678'f32, -0.70710678'f32),
+                nibRatio = DefaultNibRatio): Stroke =
+  var dir = nibDir.normalized
+  if dir.lenSq < 0.5'f32: dir = vec2(0.70710678'f32, -0.70710678'f32)
   Stroke(color: color, baseWidth: baseWidth, alive: true, bbox: emptyAabb(),
          minRatio: clamp(minRatio, 0'f32, 1'f32),
          smoothing: clamp(smoothing, 0'f32, 1'f32),
+         kind: kind, nibDir: dir,
+         nibRatio: clamp(nibRatio, 0.02'f32, 1'f32),
          tau: streamlineTau(streamline))
 
 ## Append a sample, lightly de-noised: drop samples that land almost on top
@@ -125,9 +154,12 @@ proc finishCapture*(s: var Stroke) =
 
 ## Moving average (triangular weights) with a window that shrinks towards
 ## the ends so the first and last samples stay exactly where they were.
+func smoothRadius(amount: float32): int {.inline.} =
+  int(amount * float32(MaxSmoothRadius) + 0.5'f32)
+
 proc smoothed(raw: seq[InputSample], amount: float32): seq[InputSample] =
   let n = raw.len
-  let r = int(amount * float32(MaxSmoothRadius) + 0.5'f32)
+  let r = smoothRadius(amount)
   if r <= 0 or n < 3: return raw
   result = newSeq[InputSample](n)
   for i in 0 ..< n:
@@ -191,23 +223,136 @@ proc resample(raw: seq[InputSample]): tuple[pts: seq[Vec2], pr: seq[float32]] =
   (pts, pr)
 
 proc widthAt(s: Stroke, pressure: float32): float32 {.inline.} =
+  ## Half-width (disc radius, or half nib length) for a pressure 0..1.
   let r = s.minRatio + (1.0'f32 - s.minRatio) * pressure
-  max(0.5'f32 * s.baseWidth * r, 0.3'f32)      # half-width, never vanishing
+  max(0.5'f32 * s.baseWidth * r, 0.3'f32)
 
-proc pushCap(outline: var seq[float32], center, normal: Vec2, forward: bool) =
-  ## Emit a round cap as a fan of points sweeping the half-width normal
-  ## across a semicircle. `normal` is the +half-width offset vector.
-  var nx = normal.x
-  var ny = normal.y
-  # sweeping direction depends on which end we are rounding
-  let c = CapCos
-  let sgn = if forward: CapSin else: -CapSin
-  for _ in 0 ..< CapSteps:
-    let rx = nx * c - ny * sgn
-    let ry = nx * sgn + ny * c
-    nx = rx; ny = ry
-    outline.add center.x + nx
-    outline.add center.y + ny
+# --------------------------------------------------------------------------
+# The tip: a convex polygon with vertices in counter-clockwise order (y-up
+# sense), scaled per sample. Its edge directions do not depend on the scale,
+# so which vertex faces a given direction ("support vertex") is the same
+# whatever the pressure.
+# --------------------------------------------------------------------------
+
+var unitCircle: array[CircleSegs, Vec2]
+var unitCircleReady = false
+
+proc ensureCircle() =
+  if unitCircleReady: return
+  var c = 1.0
+  var sn = 0.0
+  for k in 0 ..< CircleSegs:
+    unitCircle[k] = vec2(float32(c), float32(sn))
+    let nc = c * StepCos - sn * StepSin
+    sn = c * StepSin + sn * StepCos
+    c = nc
+  unitCircleReady = true
+
+func tipCount(s: Stroke): int {.inline.} =
+  if s.kind == bkNib: 4 else: CircleSegs
+
+func nibThickness(s: Stroke): float32 {.inline.} =
+  max(0.5'f32 * s.baseWidth * s.nibRatio, 0.35'f32)
+
+## Vertex k of the tip at half-size h, relative to the tip centre.
+proc tipVertex(s: Stroke, k: int, h: float32): Vec2 {.inline.} =
+  if s.kind == bkRound: return unitCircle[k] * h
+  let u = s.nibDir
+  let v = perp(u)
+  let t = s.nibThickness
+  case k
+  of 0: u * h - v * t
+  of 1: u * h + v * t
+  of 2: v * t - u * h
+  else: (u * h + v * t) * -1'f32
+
+## Index of the tip vertex furthest in direction n.
+proc support(s: Stroke, n: Vec2): int =
+  if s.kind == bkNib:
+    let su = dot(s.nibDir, n) >= 0'f32
+    let sv = dot(perp(s.nibDir), n) >= 0'f32
+    return (if su: (if sv: 1 else: 0) else: (if sv: 2 else: 3))
+  var best = 0
+  var bestDot = -2'f32
+  for k in 0 ..< CircleSegs:
+    let d = dot(unitCircle[k], n)
+    if d > bestDot: bestDot = d; best = k
+  best
+
+proc addPt(o: var seq[Vec2], p: Vec2) {.inline.} =
+  if o.len == 0 or (p - o[^1]).lenSq > 1e-8'f32: o.add p
+
+## Walk tip vertices from index `a` to `b` (exclusive of `a`, inclusive of
+## `b`) stepping by `dir` (+1 / -1), appending them around centre `c`.
+proc walk(s: Stroke, o: var seq[Vec2], c: Vec2, h: float32, a, b, dir: int) =
+  let K = s.tipCount
+  var k = a
+  var guard = 0
+  while k != b and guard < K:
+    k = (k + dir + K) mod K
+    o.addPt c + s.tipVertex(k, h)
+    inc guard
+
+## The whole stroke as one closed contour.
+proc sweep(s: var Stroke, pts0: seq[Vec2], prs0: seq[float32]) =
+  ensureCircle()
+  # drop repeated positions (keep the fattest), they carry no direction
+  var pts: seq[Vec2]
+  var h: seq[float32]
+  for i in 0 ..< pts0.len:
+    let w = s.widthAt(prs0[i])
+    if pts.len > 0 and (pts0[i] - pts[^1]).lenSq < 1e-6'f32:
+      h[^1] = max(h[^1], w)
+    else:
+      pts.add pts0[i]
+      h.add w
+  let n = pts.len
+  let K = s.tipCount
+  var contour: seq[Vec2]
+  if n == 1:
+    for k in countdown(K - 1, 0): contour.addPt pts[0] + s.tipVertex(k, h[0])
+  else:
+    var d = newSeq[Vec2](n - 1)
+    var kL = newSeq[int](n - 1)
+    var kR = newSeq[int](n - 1)
+    for i in 0 ..< n - 1:
+      d[i] = (pts[i + 1] - pts[i]).normalized
+      let nl = perp(d[i])
+      kL[i] = s.support(nl)
+      kR[i] = s.support(nl * -1'f32)
+    var left, right: seq[Vec2]           # both built start -> end
+    left.addPt pts[0] + s.tipVertex(kL[0], h[0])
+    right.addPt pts[0] + s.tipVertex(kR[0], h[0])
+    for j in 1 ..< n:
+      let p = pts[j]
+      left.addPt p + s.tipVertex(kL[j - 1], h[j])
+      right.addPt p + s.tipVertex(kR[j - 1], h[j])
+      if j == n - 1: break
+      let turn = cross(d[j - 1], d[j])
+      # a dead-straight reversal has no side; treat it as a right turn
+      let rightTurn = turn < 0'f32 or (turn == 0'f32 and dot(d[j - 1], d[j]) < 0'f32)
+      if rightTurn:
+        # left is the outside: follow the tip clockwise; right: via the centre
+        s.walk(left, p, h[j], kL[j - 1], kL[j], -1)
+        if kR[j - 1] != kR[j]: right.addPt p
+      else:
+        if kL[j - 1] != kL[j]: left.addPt p
+        s.walk(right, p, h[j], kR[j - 1], kR[j], +1)
+      left.addPt p + s.tipVertex(kL[j], h[j])
+      right.addPt p + s.tipVertex(kR[j], h[j])
+    # left edge, end cap (clockwise round the front), right edge back,
+    # start cap (clockwise round the back)
+    for q in left: contour.addPt q
+    s.walk(contour, pts[n - 1], h[n - 1], kL[n - 2], kR[n - 2], -1)
+    for i in countdown(right.len - 1, 0): contour.addPt right[i]
+    s.walk(contour, pts[0], h[0], kR[0], kL[0], -1)
+    if contour.len > 1 and (contour[^1] - contour[0]).lenSq <= 1e-8'f32:
+      contour.setLen(contour.len - 1)    # closePath joins them anyway
+  if contour.len < 3: return
+  s.outline.add float32(contour.len)
+  for q in contour:
+    s.outline.add q.x
+    s.outline.add q.y
 
 ## Rebuild `outline`, `centerline` and `bbox` from the stabilised samples.
 proc retessellate*(s: var Stroke) =
@@ -216,61 +361,9 @@ proc retessellate*(s: var Stroke) =
   s.bbox = emptyAabb()
   let (pts, prs) = resample(smoothed(s.raw, s.smoothing))
   if pts.len == 0: return
-
   s.centerline = pts
   for p in pts: s.bbox.expand(p)
-
-  if pts.len == 1:
-    # a dot: emit a small diamond so single taps are visible
-    let hw = s.widthAt(prs[0])
-    let c = pts[0]
-    let d = max(hw, 0.75'f32)
-    s.outline.add c.x - d; s.outline.add c.y
-    s.outline.add c.x;     s.outline.add c.y - d
-    s.outline.add c.x + d; s.outline.add c.y
-    s.outline.add c.x;     s.outline.add c.y + d
-    s.bbox = s.bbox.pad(d)
-    return
-
-  # Per-point normals from averaged adjacent segment directions.
-  let n = pts.len
-  var normals = newSeq[Vec2](n)
-  for i in 0 ..< n:
-    var dir: Vec2
-    if i == 0:
-      dir = (pts[1] - pts[0])
-    elif i == n - 1:
-      dir = (pts[n - 1] - pts[n - 2])
-    else:
-      dir = (pts[i + 1] - pts[i - 1])
-    normals[i] = perp(dir.normalized)
-
-  # Left side forward, then right side backward => single closed polygon.
-  var left: seq[float32]
-  var right: seq[float32]
-  for i in 0 ..< n:
-    let hw = s.widthAt(prs[i])
-    let off = normals[i] * hw
-    left.add pts[i].x + off.x
-    left.add pts[i].y + off.y
-    right.add pts[i].x - off.x
-    right.add pts[i].y - off.y
-
-  # start cap (round), around first point using its normal*hw
-  let hw0 = s.widthAt(prs[0])
-  pushCap(s.outline, pts[0], normals[0] * hw0, forward = false)
-  # left side, start -> end
-  for i in 0 ..< n:
-    s.outline.add left[i * 2]
-    s.outline.add left[i * 2 + 1]
-  # end cap
-  let hwN = s.widthAt(prs[n - 1])
-  pushCap(s.outline, pts[n - 1], normals[n - 1] * hwN, forward = true)
-  # right side, end -> start
-  for i in countdown(n - 1, 0):
-    s.outline.add right[i * 2]
-    s.outline.add right[i * 2 + 1]
-
+  s.sweep(pts, prs)
   s.bbox = s.bbox.pad(0.5'f32 * s.baseWidth + 1.0'f32)
 
 ## Distance test used by the eraser: true when `p` lies within `radius`

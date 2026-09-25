@@ -20,7 +20,7 @@ an endless canvas — and delivers them as a page you can open anywhere.
 
 The performance-critical core (stroke smoothing, variable-width tessellation,
 spatial hit-testing, undo history, serialization) is written in Nim and
-cross-compiled to a ~25 KB `wasm32` module. The build approach — driving Nim
+cross-compiled to a ~30 KB `wasm32` module. The build approach — driving Nim
 through `clang`/`wasm-ld` to a freestanding WebAssembly binary with a tiny libc
 shim — is inspired by
 [**bindweb-nim-WASM-compiler**](https://github.com/benagastov/bindweb-nim-WASM-compiler),
@@ -28,17 +28,26 @@ here reduced to a single command-line pipeline instead of an in-browser IDE.
 
 ### Features
 
-- **Pressure-sensitive brush**: real stylus pressure (S Pen, Apple Pencil,
-  Wacom via Pointer Events) drives stroke width. Strokes are Catmull-Rom
-  smoothed and rendered as filled vector outlines with rounded caps.
+- **Four brushes**, each remembering its own size and settings. Pick one by
+  tapping the pen button again or pressing `1`–`4`.
+  - **Ballpoint**: a thin, even line with only a slight pressure response.
+  - **Fountain pen**: pressure tapers the line from hairline to full width.
+  - **Calligraphy**: a flat, angled nib, so thick and thin come from the
+    direction you move, like a real broad-edge pen. The nib angle is adjustable.
+  - **Marker**: broad, nearly constant width and translucent ink that stays
+    even where a stroke crosses itself.
+- **True vector strokes**: the tip shape (a disc, or the flat nib) is swept
+  along the smoothed path and emitted as one closed outline per stroke. That
+  gives clean round ends, solid sharp corners and no anti-aliasing seams, and
+  the stroke you see while drawing is pixel-identical to the saved one.
 - **Procreate-style stabilization** (Brush ⚙ panel):
   - **StreamLine**: a time-based pull on the nib that removes hand jitter.
     It follows event timestamps, so a 240 Hz S Pen and a 60 Hz mouse feel the
     same. When the pen lifts, the line eases onto the lift point.
   - **Smoothing**: evens out the finished path; endpoints stay where you put them.
 - **Pressure settings**: on/off, a soft ↔ firm **pressure curve** with a live
-  preview graph and pen-pressure meter, and **Min size** (width at the
-  lightest touch).
+  preview graph and pen-pressure meter, and a per-brush **Min size** (width at
+  the lightest touch) and **Opacity**.
 - **Touch navigation**: pinch to zoom (anchored between your fingers), two
   fingers to pan, **2-finger tap = undo, 3-finger tap = redo**.
 - **Pen-first input**: fingers draw until a stylus is used, then switch to
@@ -46,9 +55,9 @@ here reduced to a single command-line pipeline instead of an in-browser IDE.
   ignores touches while the pen is down. The **S Pen side button erases**.
 - **Infinite canvas**: pan and zoom are a pure Canvas2D transform. Committed
   strokes are cached in a layer, so only the live stroke redraws while you draw.
-- **Tools**: pen, stroke eraser (one drag = one undo step), pan.
-- **Undo / redo**, **Save / open** (`.qsketch`, which keeps each stroke's
-  brush settings), **Export PNG**.
+- **Tools**: pen, stroke eraser with its own size (one drag = one undo step), pan.
+- **Undo / redo**, **Save / open** (`.qsketch` stores each stroke's tip and
+  brush settings; older files still open), **Export PNG**.
 - **No runtime dependencies**: one HTML file, one JS file, one CSS file and one
   self-contained `.wasm` with zero imports. Light/dark aware; settings are
   remembered per browser.
@@ -81,7 +90,7 @@ Source layout:
 |------|------|
 | `src/qsketch.nim` | WASM entry points / ABI |
 | `src/engine/geometry.nim` | vec2 / AABB maths |
-| `src/engine/stroke.nim` | StreamLine + smoothing, variable-width outline tessellation |
+| `src/engine/stroke.nim` | StreamLine + smoothing, tip sweep → one outline per stroke (round tip, calligraphy nib) |
 | `src/engine/document.nim` | stroke store, undo/redo, binary (de)serialize |
 | `web/` | the static site (`index.html`, `app.js`, `styles.css`, built `qsketch.wasm`) |
 | `build/walloc.c`, `build/inc/` | freestanding libc shim + stub headers |
@@ -126,6 +135,7 @@ No secrets or servers required — it's a fully static build.
 | 2-finger tap | Undo | 3-finger tap | Redo |
 | `P` / `E` / `H` | Pen / Eraser / Pan | hold `Space` | Pan |
 | `[` / `]` | Size − / + | `B` | Brush settings |
+| `1`–`4` | Ballpoint / Fountain / Calligraphy / Marker | tap pen again | Brush picker |
 | `Ctrl/⌘ Z` | Undo | `Ctrl/⌘ Shift Z`, `Ctrl Y` | Redo |
 | scroll | Zoom to cursor | `+` / `-` / `0` | Zoom / reset view |
 

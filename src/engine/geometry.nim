@@ -15,6 +15,7 @@ func `-`*(a, b: Vec2): Vec2 {.inline.} = vec2(a.x - b.x, a.y - b.y)
 func `*`*(a: Vec2, s: float32): Vec2 {.inline.} = vec2(a.x * s, a.y * s)
 
 func dot*(a, b: Vec2): float32 {.inline.} = a.x * b.x + a.y * b.y
+func cross*(a, b: Vec2): float32 {.inline.} = a.x * b.y - a.y * b.x
 func lenSq*(a: Vec2): float32 {.inline.} = a.x * a.x + a.y * a.y
 func len*(a: Vec2): float32 {.inline.} = sqrt(a.x * a.x + a.y * a.y)
 
