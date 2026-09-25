@@ -17,14 +17,23 @@
 ## * nib   -- a flat, angled calligraphy nib (a thin rectangle): thick or thin
 ##   depending on the direction of travel relative to the nib
 ##
-## Input goes through two Procreate-style stabilisers:
+## Input goes through three stabilisers, in this order:
 ##
+## * Stabilizer (pull string) -- the ink follows the pen on a string of fixed
+##   length and only moves once the pen is further away than that. Tremor
+##   shorter than the string never reaches the paper, and the direction of
+##   the line stays steady however slowly you write, which matters most for
+##   a flat calligraphy nib, where direction *is* thickness. The string length
+##   is set in screen pixels at stroke start, so it feels the same at any zoom.
 ## * StreamLine -- a time-based exponential "pull" on the pen position. It is
 ##   driven by event timestamps rather than per-sample, so a 240 Hz S Pen and
 ##   a 60 Hz mouse feel identical. When the pen lifts, the filtered point is
 ##   eased onto the lift position so strokes end where the pen did.
 ## * Smoothing -- a non-destructive moving average over the (already
 ##   stabilised) samples, applied at tessellation time, endpoints pinned.
+##
+## When the pen lifts, the ink is brought onto the lift point, so every
+## stroke ends where the pen did (short dabs still leave their mark).
 
 import std/math
 import geometry
@@ -49,13 +58,16 @@ type
     color*: uint32          ## 0xRRGGBBAA
     baseWidth*: float32     ## nominal (max) diameter in world units
     minRatio*: float32      ## width at zero pressure, relative to baseWidth
-    smoothing*: float32     ## 0..1 moving-average strength
+    smoothing*: float32     ## 0..MaxSmoothing moving-average strength
     kind*: BrushKind
     nibDir*: Vec2           ## unit vector along the nib edge (bkNib)
     nibRatio*: float32      ## nib thickness relative to baseWidth (bkNib)
     bbox*: Aabb
     alive*: bool
     # --- capture-only state (not serialized) ---
+    rope: float32           ## pull-string length in world units (0 = off)
+    ropeTip: Vec2           ## where the string holds the ink
+    pen: Vec2               ## latest raw pen position
     tau: float32            ## StreamLine time constant in ms (0 = off)
     filt: Vec2              ## current stabilised position
     filtPr: float32         ## current stabilised pressure
@@ -71,7 +83,8 @@ const
   # cos/sin of 2*PI/CircleSegs, so the table is built without libm.
   StepCos = 0.99518472667219688
   StepSin = 0.09801714032956060
-  MaxSmoothRadius = 10          ## samples each side at smoothing = 1
+  MaxSmoothRadius = 10          ## samples each side per 1.0 of smoothing
+  MaxSmoothing* = 3'f32         ## smoothing range (UI 100% = 3.0 = 30 samples)
   CatchUpStepMs = 8.0'f32       ## simulated frame length when easing to pen-lift
   CatchUpMaxSteps = 90
 
@@ -85,24 +98,26 @@ func expNeg(x: float32): float32 =
   for _ in 0 ..< 8: y = y * y
   y
 
-## `streamline` in 0..1 maps to a time constant: 0 = off, 1 = heavy lag.
+## `streamline` in 0..1 maps to a time constant: 0 = off, 1 = very heavy.
+## (0.5 here equals the old 100%; the top half is extra headroom.)
 func streamlineTau*(streamline: float32): float32 =
   let s = clamp(streamline, 0'f32, 1'f32)
-  if s <= 0.001'f32: 0'f32 else: 8'f32 + 140'f32 * s * s
+  if s <= 0.001'f32: 0'f32 else: 8'f32 + 560'f32 * s * s
 
 func newStroke*(color: uint32, baseWidth: float32,
                 minRatio = DefaultMinRatio, smoothing = 0'f32,
                 streamline = 0'f32, kind = bkRound,
                 nibDir = vec2(0.70710678'f32, -0.70710678'f32),
-                nibRatio = DefaultNibRatio): Stroke =
+                nibRatio = DefaultNibRatio, rope = 0'f32): Stroke =
   var dir = nibDir.normalized
   if dir.lenSq < 0.5'f32: dir = vec2(0.70710678'f32, -0.70710678'f32)
   Stroke(color: color, baseWidth: baseWidth, alive: true, bbox: emptyAabb(),
          minRatio: clamp(minRatio, 0'f32, 1'f32),
-         smoothing: clamp(smoothing, 0'f32, 1'f32),
+         smoothing: clamp(smoothing, 0'f32, MaxSmoothing),
          kind: kind, nibDir: dir,
          nibRatio: clamp(nibRatio, 0.02'f32, 1'f32),
-         tau: streamlineTau(streamline))
+         tau: streamlineTau(streamline),
+         rope: (if rope > 0'f32: rope else: 0'f32))   # also turns NaN into "off"
 
 ## Append a sample, lightly de-noised: drop samples that land almost on top
 ## of the previous one so the smoothing spline stays well conditioned.
@@ -121,18 +136,32 @@ proc stepFilter(s: var Stroke, dt: float32) {.inline.} =
   s.filt = lerp(s.filt, s.target, a)
   s.filtPr = s.filtPr + (s.targetPr - s.filtPr) * a
 
+## Pull string: the ink moves only when the pen is further away than the
+## string, and then just enough to keep the string taut.
+proc pullString(s: var Stroke, p: Vec2): Vec2 {.inline.} =
+  if s.rope <= 0'f32: return p
+  let d = p - s.ropeTip
+  let L = d.len
+  if L > s.rope:
+    s.ropeTip = s.ropeTip + d * (1'f32 - s.rope / L)
+  s.ropeTip
+
 ## Feed one pen sample (world coords, pressure 0..1, timestamp in ms)
-## through StreamLine and into the stroke.
+## through the pull string and StreamLine and into the stroke.
 proc capture*(s: var Stroke, p: Vec2, pressure: float32, t: float32) =
   let pr = clamp(pressure, 0'f32, 1'f32)
-  s.target = p
+  s.pen = p
+  if not s.started:
+    s.ropeTip = p
+  let q = s.pullString(p)
+  s.target = q
   s.targetPr = pr
   if not s.started or s.tau <= 0'f32:
     s.started = true
-    s.filt = p
+    s.filt = q
     s.filtPr = pr
     s.lastT = t
-    s.addSample(p, pr)
+    s.addSample(q, pr)
     return
   var dt = t - s.lastT
   if dt < 0'f32: dt = 0'f32
@@ -141,16 +170,29 @@ proc capture*(s: var Stroke, p: Vec2, pressure: float32, t: float32) =
   s.stepFilter(dt)
   s.addSample(s.filt, s.filtPr)
 
-## Pen lifted: ease the stabilised point onto the lift position, as if the
-## pen had kept still for a few frames, so the stroke ends under the nib.
+## Where the ink currently is (the end of the live stroke), for the UI.
+func inkTip*(s: Stroke): Vec2 = s.filt
+
+## Pen lifted: bring the ink onto the lift point, as if the pen had kept
+## still for a few frames, so the stroke ends under the nib.
 proc finishCapture*(s: var Stroke) =
-  if not s.started or s.tau <= 0'f32: return
-  var i = 0
-  while i < CatchUpMaxSteps and (s.target - s.filt).lenSq > 0.0625'f32:
-    s.stepFilter(CatchUpStepMs)
-    s.addSample(s.filt, s.filtPr)
-    inc i
-  s.addSample(s.target, s.filtPr)
+  if not s.started: return
+  s.target = s.pen
+  if s.tau > 0'f32:
+    var i = 0
+    while i < CatchUpMaxSteps and (s.target - s.filt).lenSq > 0.0625'f32:
+      s.stepFilter(CatchUpStepMs)
+      s.addSample(s.filt, s.filtPr)
+      inc i
+  elif s.rope > 0'f32:
+    # no time filter: walk the slack of the string in even steps
+    let a = s.filt
+    let d = s.pen - a
+    let n = int(d.len / 2'f32)
+    for k in 1 .. n:
+      s.addSample(a + d * (float32(k) / float32(n + 1)), s.filtPr)
+  s.filt = s.pen
+  s.addSample(s.pen, s.filtPr)
 
 ## Moving average (triangular weights) with a window that shrinks towards
 ## the ends so the first and last samples stay exactly where they were.
@@ -266,17 +308,41 @@ proc tipVertex(s: Stroke, k: int, h: float32): Vec2 {.inline.} =
   of 2: v * t - u * h
   else: (u * h + v * t) * -1'f32
 
-## Index of the tip vertex furthest in direction n.
-proc support(s: Stroke, n: Vec2): int =
-  if s.kind == bkNib:
-    let su = dot(s.nibDir, n) >= 0'f32
-    let sv = dot(perp(s.nibDir), n) >= 0'f32
-    return (if su: (if sv: 1 else: 0) else: (if sv: 2 else: 3))
+## Index of the tip vertex furthest in direction n. When two vertices are
+## (almost) equally far -- e.g. a nib moving exactly across or along its
+## edge -- keep `prev`, so rounding noise can't flip the outline between
+## them sample after sample (a zero-area zig-zag along the edge).
+proc support(s: Stroke, n: Vec2, prev = -1): int =
+  if s.kind == bkRound:
+    # disc: compare unit vectors directly (same ordering at any radius)
+    if prev >= 0:
+      # the answer moves only a step or two between samples, and a convex
+      # tip has a single peak: climb from the previous vertex
+      var k = prev
+      var d = dot(unitCircle[k], n)
+      while true:
+        let up = (k + 1) mod CircleSegs
+        let dn = (k + CircleSegs - 1) mod CircleSegs
+        let du = dot(unitCircle[up], n)
+        let dd = dot(unitCircle[dn], n)
+        if du > d + 1e-5'f32 and du >= dd: k = up; d = du
+        elif dd > d + 1e-5'f32: k = dn; d = dd
+        else: break
+      return k
+    var best = 0
+    var bestDot = -2'f32
+    for k in 0 ..< CircleSegs:
+      let d = dot(unitCircle[k], n)
+      if d > bestDot: bestDot = d; best = k
+    return best
+  let h = 0.5'f32 * s.baseWidth
   var best = 0
-  var bestDot = -2'f32
-  for k in 0 ..< CircleSegs:
-    let d = dot(unitCircle[k], n)
+  var bestDot = -Inf.float32
+  for k in 0 ..< 4:
+    let d = dot(s.tipVertex(k, h), n)
     if d > bestDot: bestDot = d; best = k
+  if prev >= 0 and dot(s.tipVertex(prev, h), n) >= bestDot - 1e-4'f32 * max(h, 1'f32):
+    return prev
   best
 
 proc addPt(o: var seq[Vec2], p: Vec2) {.inline.} =
@@ -318,8 +384,8 @@ proc sweep(s: var Stroke, pts0: seq[Vec2], prs0: seq[float32]) =
     for i in 0 ..< n - 1:
       d[i] = (pts[i + 1] - pts[i]).normalized
       let nl = perp(d[i])
-      kL[i] = s.support(nl)
-      kR[i] = s.support(nl * -1'f32)
+      kL[i] = s.support(nl, if i > 0: kL[i - 1] else: -1)
+      kR[i] = s.support(nl * -1'f32, if i > 0: kR[i - 1] else: -1)
     var left, right: seq[Vec2]           # both built start -> end
     left.addPt pts[0] + s.tipVertex(kL[0], h[0])
     right.addPt pts[0] + s.tipVertex(kR[0], h[0])

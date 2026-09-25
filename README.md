@@ -32,19 +32,27 @@ here reduced to a single command-line pipeline instead of an in-browser IDE.
   tapping the pen button again or pressing `1`–`4`.
   - **Ballpoint**: a thin, even line with only a slight pressure response.
   - **Fountain pen**: pressure tapers the line from hairline to full width.
-  - **Calligraphy**: a flat, angled nib, so thick and thin come from the
-    direction you move, like a real broad-edge pen. The nib angle is adjustable.
+  - **Calligraphy**: a rigid, flat, angled nib (like a qalam or broad-edge
+    pen), so thick and thin come from the direction you move. A one-nib-width
+    dab straight across the nib makes a clean rhombic dot (the "diamond" unit
+    of Arabic calligraphy). The nib angle is adjustable.
   - **Marker**: broad, nearly constant width and translucent ink that stays
     even where a stroke crosses itself.
 - **True vector strokes**: the tip shape (a disc, or the flat nib) is swept
   along the smoothed path and emitted as one closed outline per stroke. That
   gives clean round ends, solid sharp corners and no anti-aliasing seams, and
   the stroke you see while drawing is pixel-identical to the saved one.
-- **Procreate-style stabilization** (Brush ⚙ panel):
+- **Stabilization** (Brush ⚙ panel, per brush):
+  - **Stabilizer** (pull string): the ink trails the pen on a visible string
+    and only moves once the pen is further away than the string. Hand tremor
+    never reaches the page and the line goes exactly as fast as you steer it,
+    which is ideal for slow, careful calligraphy. Set in screen pixels, so it
+    feels the same at any zoom.
   - **StreamLine**: a time-based pull on the nib that removes hand jitter.
     It follows event timestamps, so a 240 Hz S Pen and a 60 Hz mouse feel the
     same. When the pen lifts, the line eases onto the lift point.
   - **Smoothing**: evens out the finished path; endpoints stay where you put them.
+  - StreamLine and Smoothing go well past their old maximums (2× and 3×).
 - **Pressure settings**: on/off, a soft ↔ firm **pressure curve** with a live
   preview graph and pen-pressure meter, and a per-brush **Min size** (width at
   the lightest touch) and **Opacity**.

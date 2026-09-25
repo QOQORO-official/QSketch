@@ -38,15 +38,19 @@ proc qs_alloc(n: int32): pointer {.wexport.} =
 
 proc qs_begin_stroke(color: uint32, baseWidth, minRatio, smoothing,
                      streamline: float32, kind: int32,
-                     nibX, nibY, nibRatio: float32) {.wexport.} =
+                     nibX, nibY, nibRatio, rope: float32) {.wexport.} =
   ## Start a stroke. `minRatio` is the width at zero pressure relative to
-  ## `baseWidth`; `smoothing` and `streamline` are 0..1 stabiliser strengths.
+  ## `baseWidth`; `smoothing` (0..3) and `streamline` (0..1) are stabiliser
+  ## strengths; `rope` is the pull-string length in world units (0 = off).
   ## `kind` 0 = round tip, 1 = flat calligraphy nib along (nibX, nibY) with
   ## thickness `nibRatio` * baseWidth.
   let k = if kind == int32(ord(bkNib)): bkNib else: bkRound
   live = newStroke(color, baseWidth, minRatio, smoothing, streamline,
-                   k, vec2(nibX, nibY), nibRatio)
+                   k, vec2(nibX, nibY), nibRatio, rope)
   drawing = true
+
+proc qs_live_tip_x(): float32 {.wexport.} = live.inkTip.x
+proc qs_live_tip_y(): float32 {.wexport.} = live.inkTip.y
 
 proc qs_add_point(x, y, pressure, timeMs: float32) {.wexport.} =
   ## Queue one pen sample. Cheap: tessellation is deferred to

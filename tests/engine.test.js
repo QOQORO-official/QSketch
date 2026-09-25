@@ -17,12 +17,12 @@ const ROUND = 0, NIB = 1;
 const NIB45 = [Math.SQRT1_2, -Math.SQRT1_2];   // edge rising to the right (y down)
 
 // begin a stroke with defaults for the new tip parameters
-function begin(e, color, width, minRatio, smoothing, streamline, kind = ROUND, nib = NIB45, nibRatio = 0.15) {
-  e.qs_begin_stroke(color >>> 0, width, minRatio, smoothing, streamline, kind, nib[0], nib[1], nibRatio);
+function begin(e, color, width, minRatio, smoothing, streamline, kind = ROUND, nib = NIB45, nibRatio = 0.15, rope = 0) {
+  e.qs_begin_stroke(color >>> 0, width, minRatio, smoothing, streamline, kind, nib[0], nib[1], nibRatio, rope);
 }
 function draw(e, pts, opts = {}) {
-  const { width = 4, minRatio = 1, smoothing = 0, streamline = 0, kind = ROUND, nib, nibRatio, color = 0xff } = opts;
-  begin(e, color, width, minRatio, smoothing, streamline, kind, nib, nibRatio);
+  const { width = 4, minRatio = 1, smoothing = 0, streamline = 0, kind = ROUND, nib, nibRatio, color = 0xff, rope = 0 } = opts;
+  begin(e, color, width, minRatio, smoothing, streamline, kind, nib, nibRatio, rope);
   pts.forEach(([x, y, p = 1], i) => e.qs_add_point(x, y, p, i * 8));
   return e.qs_commit_stroke();
 }
@@ -170,7 +170,7 @@ function jitter(streamline, smoothing) {
   }
   return { h: maxy - miny, maxx };
 }
-const raw = jitter(0, 0), sm = jitter(0, 0.8), sl = jitter(0.6, 0), both = jitter(0.6, 0.8);
+const raw = jitter(0, 0), sm = jitter(0, 0.8), sl = jitter(0.3, 0), both = jitter(0.3, 0.8);   // 0.3 = the old 0.6
 console.log('mid-stroke band height  raw:', raw.h.toFixed(2), ' smoothing:', sm.h.toFixed(2),
             ' streamline:', sl.h.toFixed(2), ' both:', both.h.toFixed(2));
 check('smoothing reduces jitter', sm.h < raw.h * 0.7);
@@ -181,7 +181,7 @@ check('streamline catches up to pen-lift (x=300 + radius)', both.maxx > 301, 'ma
 // rate independence: same path at 60Hz vs 240Hz should end up similarly smooth
 function rate(hz) {
   const e = boot();
-  begin(e, 0xff, 4, 0.2, 0, 0.6);
+  begin(e, 0xff, 4, 0.2, 0, 0.3);
   let t = 0; const dt = 1000 / hz;
   for (let k = 0; k <= hz / 2; k++) { e.qs_add_point(k * (600 / hz), 100 + ((k % 2) ? 6 : -6), 0.6, t); t += dt; }
   const b = bounds(polys(e, e.qs_commit_stroke()));
@@ -201,6 +201,112 @@ function width(minR) {
 }
 const w1 = width(0.1), w9 = width(0.9);
 check('min size controls zero-pressure width', w1 < w9 * 0.3, `min10%=${w1.toFixed(2)} min90%=${w9.toFixed(2)}`);
+
+// ------------------------------------------------------ slow, careful writing
+// A 300-unit line with +-3 tremor at 240 Hz, drawn at a normal pace or at a
+// slow calligraphy pace. Returns the wobble left in the middle third.
+function tremor(pace, { smoothing = 0, streamline = 0, rope = 0, kind = ROUND, width = 4 } = {}) {
+  const e = boot();
+  begin(e, 0xff, width, 1, smoothing, streamline, kind, NIB45, 0.15, rope);
+  let seed = 7; const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647 - 0.5);
+  const n = Math.round(300 / pace * 240);
+  for (let i = 0; i <= n; i++) e.qs_add_point(i / n * 300, 100 + rnd() * 6, 1, i * 1000 / 240);
+  const ps = polys(e, e.qs_commit_stroke());
+  const mid = allPts(ps).filter(([x]) => x > 100 && x < 200).map(([, y]) => y);
+  // perimeter of the whole outline vs a clean stroke: how ragged the edges are
+  let per = 0;
+  for (const poly of ps) for (let i = 0; i < poly.length; i++) {
+    const [x1, y1] = poly[i], [x2, y2] = poly[(i + 1) % poly.length]; per += Math.hypot(x2 - x1, y2 - y1);
+  }
+  return { wobble: Math.max(...mid) - Math.min(...mid) - width, ragged: per / (2 * 300) };
+}
+{
+  const slow = 40;                                   // units per second
+  const none = tremor(slow), s1 = tremor(slow, { smoothing: 1 }), s3 = tremor(slow, { smoothing: 3 });
+  check('smoothing goes 3x further than before', s3.wobble < s1.wobble * 0.6,
+        `slow line wobble: off ${none.wobble.toFixed(2)}, old max ${s1.wobble.toFixed(2)}, new max ${s3.wobble.toFixed(2)}`);
+  const t5 = tremor(slow, { streamline: 0.5 }), t10 = tremor(slow, { streamline: 1 });
+  check('StreamLine has headroom past the old maximum', t10.wobble < t5.wobble * 0.7,
+        `old max (50%) ${t5.wobble.toFixed(2)}, new max ${t10.wobble.toFixed(2)}`);
+}
+// A real hand: a 9 Hz physiological tremor plus slower drift (not white noise,
+// which every filter removes easily). Calligraphy nib, width 14, slow pace.
+function hand(pace, { smoothing = 0, streamline = 0, rope = 0, amp = 1.5 } = {}) {
+  const e = boot();
+  begin(e, 0xff, 14, 1, smoothing, streamline, NIB, NIB45, 0.15, rope);
+  const n = Math.round(300 / pace * 240);
+  for (let i = 0; i <= n; i++) {
+    const t = i / 240;
+    const y = 100 + amp * (Math.sin(2 * Math.PI * 9 * t) + 0.6 * Math.sin(2 * Math.PI * 4.3 * t + 1) + 0.4 * Math.sin(2 * Math.PI * 11.7 * t + 2));
+    e.qs_add_point(i / n * 300, y, 1, t * 1000);
+  }
+  const [poly] = polys(e, e.qs_commit_stroke());
+  let per = 0;
+  for (let i = 0; i < poly.length; i++) { const [x1, y1] = poly[i], [x2, y2] = poly[(i + 1) % poly.length]; per += Math.hypot(x2 - x1, y2 - y1); }
+  const mid = poly.filter(([x]) => x > 100 && x < 200).map(([, y]) => y);
+  return { edge: per, band: Math.max(...mid) - Math.min(...mid) };
+}
+{
+  const clean = hand(40, { amp: 0 });
+  const rel = (r) => ({ edge: r.edge / clean.edge, jitter: r.band - clean.band });
+  const oldDefaults = rel(hand(40, { smoothing: 0.4, streamline: 0.175 }));
+  const newDefaults = rel(hand(40, { smoothing: 0.3, streamline: 0.2, rope: 24 }));
+  check('calligraphy at a slow pace: old defaults were ragged', oldDefaults.edge > 1.5,
+        `edges ${oldDefaults.edge.toFixed(2)}x a clean stroke, thickness jitter ${oldDefaults.jitter.toFixed(2)}`);
+  check('calligraphy at a slow pace: new defaults are clean', newDefaults.edge < 1.02 && newDefaults.jitter < 0.3,
+        `edges ${newDefaults.edge.toFixed(2)}x, thickness jitter ${newDefaults.jitter.toFixed(2)}`);
+  const quick = rel(hand(250, { smoothing: 0.3, streamline: 0.2, rope: 24 }));
+  check('calligraphy at a brisk pace: new defaults stay steady', quick.edge < 1.02 && quick.jitter < 1,
+        `edges ${quick.edge.toFixed(2)}x, thickness jitter ${quick.jitter.toFixed(2)}`);
+}
+{ // holding the pen still with a shaky hand: the ink does not move at all
+  const e = boot();
+  begin(e, 0xff, 14, 1, 0, 0, NIB, NIB45, 0.15, 24);
+  let drift = 0;
+  for (let i = 0; i <= 240; i++) {                         // one second of ±3 tremor
+    const t = i / 240;
+    e.qs_add_point(50 + 3 * Math.sin(2 * Math.PI * 9 * t), 53 - 3 + 3 * Math.cos(2 * Math.PI * 7 * t), 1, t * 1000);
+    drift = Math.max(drift, Math.hypot(e.qs_live_tip_x() - 50, e.qs_live_tip_y() - 53));
+  }
+  check('stabilizer: a trembling pen held still does not move the ink', drift < 1e-4, `ink moved ${drift.toFixed(4)}`);
+}
+{ // the ink trails the pen by the string length, then lands on the lift point
+  const e = boot();
+  begin(e, 0xff, 4, 1, 0, 0, ROUND, NIB45, 0.15, 20);
+  for (let i = 0; i <= 50; i++) e.qs_add_point(i * 2, 0, 1, i * 8);
+  const lag = 100 - e.qs_live_tip_x();
+  const b = bounds(polys(e, e.qs_commit_stroke()));
+  check('stabilizer: ink trails the pen by the string length', Math.abs(lag - 20) < 0.01, `lag ${lag.toFixed(2)}`);
+  check('stabilizer: stroke still ends where the pen lifts', Math.abs(b.maxx - 102) < 0.2, `ends at x=${(b.maxx - 2).toFixed(2)}`);
+}
+{ // a short dab (a rhombic dot) shorter than the string still leaves its mark
+  const e = boot();
+  begin(e, 0xff, 14, 1, 0, 0, NIB, NIB45, 0.15, 20);
+  for (let i = 0; i <= 10; i++) e.qs_add_point(i * 1.2, i * 1.2, 1, i * 8);      // 17 units down-right
+  const b = bounds(polys(e, e.qs_commit_stroke()));
+  check('stabilizer: a dab shorter than the string still draws', b.maxx - b.minx > 20 && b.maxy - b.miny > 20,
+        `${(b.maxx - b.minx).toFixed(1)} x ${(b.maxy - b.miny).toFixed(1)}`);
+}
+{ // a rhombic dot: one nib-width dab straight across a 45° nib is an exact rhombus
+  const e = boot();
+  const id = draw(e, Array.from({ length: 11 }, (_, i) => [i * 1.7, i * 1.7]), { width: 24, kind: NIB });
+  const [poly] = polys(e, id);
+  let corners = 0;
+  for (let k = 0; k < poly.length; k++) {
+    const [ax, ay] = poly[(k - 1 + poly.length) % poly.length], [bx, by] = poly[k], [cx, cy] = poly[(k + 1) % poly.length];
+    const ux = bx - ax, uy = by - ay, vx = cx - bx, vy = cy - by, lu = Math.hypot(ux, uy), lv = Math.hypot(vx, vy);
+    if (lu > 1e-6 && lv > 1e-6 && Math.acos(Math.max(-1, Math.min(1, (ux * vx + uy * vy) / (lu * lv)))) > 20 * Math.PI / 180) corners++;
+  }
+  check('rhombic dot: clean rhombus outline (no zig-zag from tied nib corners)', corners === 4,
+        `${corners} corners, ${poly.length} outline points`);
+}
+{ // callers that leave the string length out must not freeze the ink
+  const e = boot();
+  e.qs_begin_stroke(0xff, 4, 1, 0, 0, 0, 1, 0, 0.15);           // no 10th argument -> NaN
+  for (let i = 0; i <= 10; i++) e.qs_add_point(i * 10, 0, 1, i * 8);
+  const b = bounds(polys(e, e.qs_commit_stroke()));
+  check('missing string length means "off", not frozen ink', b.maxx - b.minx > 100);
+}
 
 // ------------------------------------------------------ live stroke API
 {

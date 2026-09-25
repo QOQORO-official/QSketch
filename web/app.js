@@ -67,17 +67,24 @@ function zoomAbout(sx, sy, factor) {
 // per-brush default the user can tune (and that we remember per brush).
 const TIP_ROUND = 0, TIP_NIB = 1;
 const NIB_RATIO = 0.15;                 // nib thickness relative to its width
+// Slider values are stored as 0..1 of each slider's range; the engine gets
+// them scaled: StreamLine 0..1, Smoothing 0..SMOOTHING_MAX, Stabilizer
+// 0..STABILIZER_MAX_PX screen pixels (converted to world units per stroke).
+const SMOOTHING_MAX = 3;
+const STABILIZER_MAX_PX = 80;
+const SETTINGS_SCHEMA = 3;       // 3: wider StreamLine/Smoothing + Stabilizer
 const BRUSHES = [
   { id: 'ballpoint',   name: 'Ballpoint',    icon: '🖊️', kind: TIP_ROUND,
-    size: 3,  minSize: 0.70, streamline: 0.15, smoothing: 0.20, opacity: 1 },
+    size: 3,  minSize: 0.70, stabilizer: 0,    streamline: 0.08, smoothing: 0.07, opacity: 1 },
   { id: 'fountain',    name: 'Fountain pen', icon: '✒️', kind: TIP_ROUND,
-    size: 5,  minSize: 0.20, streamline: 0.30, smoothing: 0.35, opacity: 1 },
+    size: 5,  minSize: 0.20, stabilizer: 0,    streamline: 0.15, smoothing: 0.12, opacity: 1 },
+  // a qalam / broad nib is rigid: width comes from the nib angle, not pressure
   { id: 'calligraphy', name: 'Calligraphy',  icon: '🖋️', kind: TIP_NIB,
-    size: 14, minSize: 0.45, streamline: 0.35, smoothing: 0.40, opacity: 1, nibAngle: 45 },
+    size: 14, minSize: 0.85, stabilizer: 0.30, streamline: 0.20, smoothing: 0.10, opacity: 1, nibAngle: 45 },
   { id: 'marker',      name: 'Marker',       icon: '🖍️', kind: TIP_ROUND,
-    size: 18, minSize: 0.85, streamline: 0.25, smoothing: 0.30, opacity: 0.55 },
+    size: 18, minSize: 0.85, stabilizer: 0,    streamline: 0.12, smoothing: 0.10, opacity: 0.55 },
 ];
-const BRUSH_PARAMS = ['size', 'minSize', 'streamline', 'smoothing', 'opacity', 'nibAngle'];
+const BRUSH_PARAMS = ['size', 'minSize', 'stabilizer', 'streamline', 'smoothing', 'opacity', 'nibAngle'];
 
 function brushDefaults(def) {
   const out = {};
@@ -86,6 +93,7 @@ function brushDefaults(def) {
 }
 function defaultSettings() {
   return {
+    schema: SETTINGS_SCHEMA,
     brush: 'fountain',
     brushes: Object.fromEntries(BRUSHES.map(b => [b.id, brushDefaults(b)])),
     eraserSize: 24,        // screen pixels
@@ -95,7 +103,25 @@ function defaultSettings() {
     penButtonErase: true,  // S Pen / stylus barrel button = eraser
   };
 }
-let settings = loadSettings();
+// Settings saved before schema 3 used narrower StreamLine / Smoothing ranges.
+// A value the user never changed takes the new default (the old calligraphy
+// defaults in particular were too weak for slow writing); a value they did
+// tune is rescaled so it feels exactly as before.
+const OLD_DEFAULTS = {
+  ballpoint:   { minSize: 0.70, streamline: 0.15, smoothing: 0.20 },
+  fountain:    { minSize: 0.20, streamline: 0.30, smoothing: 0.35 },
+  calligraphy: { minSize: 0.45, streamline: 0.35, smoothing: 0.40 },
+  marker:      { minSize: 0.85, streamline: 0.25, smoothing: 0.30 },
+};
+function upgradeBrushParams(p, id) {
+  const out = Object.assign({}, p);
+  const untouched = OLD_DEFAULTS[id] || {};
+  for (const k of ['minSize', 'streamline', 'smoothing'])
+    if (out[k] !== undefined && out[k] === untouched[k]) delete out[k];
+  if (out.streamline !== undefined) out.streamline /= 2;      // old 100% = new 50%
+  if (out.smoothing !== undefined) out.smoothing /= 3;        // old 100% = new 33%
+  return out;
+}
 
 function loadSettings() {
   const s = defaultSettings();
@@ -103,9 +129,13 @@ function loadSettings() {
     const raw = localStorage.getItem(SETTINGS_KEY);
     if (raw) {
       const saved = JSON.parse(raw);
+      const old = (saved.schema || 2) < SETTINGS_SCHEMA;
       for (const k of ['brush', 'eraserSize', 'pressure', 'curve', 'fingers', 'penButtonErase'])
         if (saved[k] !== undefined) s[k] = saved[k];
-      for (const b of BRUSHES) Object.assign(s.brushes[b.id], (saved.brushes || {})[b.id]);
+      for (const b of BRUSHES) {
+        const p = (saved.brushes || {})[b.id];
+        if (p) Object.assign(s.brushes[b.id], old ? upgradeBrushParams(p, b.id) : p);
+      }
       if (!BRUSHES.some(b => b.id === s.brush)) s.brush = 'fountain';
       return s;
     }
@@ -115,15 +145,22 @@ function loadSettings() {
       const v1 = JSON.parse(legacy);
       for (const k of ['pressure', 'curve', 'fingers', 'penButtonErase'])
         if (v1[k] !== undefined) s[k] = v1[k];
+      const tuned = {};
       for (const k of ['streamline', 'smoothing', 'minSize'])
-        if (v1[k] !== undefined) s.brushes.fountain[k] = v1[k];
+        if (v1[k] !== undefined) tuned[k] = v1[k];
+      Object.assign(s.brushes.fountain, upgradeBrushParams(tuned, 'fountain'));
     }
-  } catch (_) { /* private mode / blocked storage */ }
+  } catch (err) {
+    // blocked storage (private mode) lands here too; never hide real bugs
+    console.warn('QSketch: could not read saved settings, using defaults', err);
+  }
   return s;
 }
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch (_) {}
 }
+// (after OLD_DEFAULTS & co. are defined: loadSettings() uses them)
+let settings = loadSettings();
 const brushDef = () => BRUSHES.find(b => b.id === settings.brush) || BRUSHES[1];
 const brushParams = () => settings.brushes[brushDef().id];
 function nibVector(deg) {
@@ -159,6 +196,7 @@ const pathCache = new Map();       // stroke id -> {path, css}
 let liveDirty = false;             // engine has new samples to tessellate
 
 let livePath = null;               // Path2D of the in-progress stroke
+let penAt = null;                  // latest pen position (screen px), for the string
 let liveCss = '';
 
 // ---- input state ----
@@ -190,6 +228,7 @@ function readTheme() {
   theme = {
     bg: cs.getPropertyValue('--canvas-bg').trim() || '#fbfcfe',
     dot: cs.getPropertyValue('--dot').trim() || '#c7cede',
+    accent: cs.getPropertyValue('--accent').trim() || '#4f6bed',
   };
   viewChanged();
 }
@@ -292,6 +331,23 @@ function render() {
     ctx.fillStyle = liveCss;
     ctx.fill(livePath);
   }
+  if (stroke && !stroke.erase && stroke.ropePx > 0 && penAt) drawString();
+}
+
+// The Stabilizer's string: from the ink to the pen, so you can see the slack.
+function drawString() {
+  const tx = E.qs_live_tip_x() * cam.scale + cam.x, ty = E.qs_live_tip_y() * cam.scale + cam.y;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.strokeStyle = theme.accent;
+  ctx.fillStyle = theme.accent;
+  ctx.globalAlpha = 0.75;
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(penAt.x, penAt.y); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath(); ctx.arc(penAt.x, penAt.y, 5, 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath(); ctx.arc(tx, ty, 2.5, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
 }
 
 // Time spent per frame on stroke work + painting (last 240 frames that did work).
@@ -353,8 +409,10 @@ function beginStroke(ev, erase) {
   const rgba = hexToRGBA(color, bp.opacity);
   const minSize = settings.pressure ? bp.minSize : 1;
   const [nx, ny] = nibVector(bp.nibAngle ?? 45);
-  E.qs_begin_stroke(rgba, bp.size, minSize, bp.smoothing, bp.streamline,
-                    def.kind, nx, ny, NIB_RATIO);
+  const ropePx = (bp.stabilizer || 0) * STABILIZER_MAX_PX;
+  E.qs_begin_stroke(rgba, bp.size, minSize, bp.smoothing * SMOOTHING_MAX, bp.streamline,
+                    def.kind, nx, ny, NIB_RATIO, ropePx / cam.scale);
+  stroke.ropePx = ropePx;
   liveCss = rgbaToCss(rgba);
   feedStroke(ev);
 }
@@ -365,6 +423,7 @@ function feedStroke(ev) {
     const w = screenToWorld(p.x, p.y);
     E.qs_add_point(w.x, w.y, mapPressure(e.pressure, e.pointerType), e.timeStamp);
     if (e.pointerType === 'pen') showPressure(e.pressure);
+    penAt = p;
   }
   liveDirty = true;
 }
@@ -700,7 +759,7 @@ function renderBrushPreviews() {
     const amp = Math.max(2, H / 2 - size / 2 - 4);
     const [nx, ny] = nibVector(bp.nibAngle ?? 45);
     E.qs_begin_stroke(hexToRGBA('#000000', 1), size, settings.pressure ? bp.minSize : 1,
-                      0, 0, def.kind, nx, ny, NIB_RATIO);
+                      0, 0, def.kind, nx, ny, NIB_RATIO, 0);
     const N = 48;
     for (let i = 0; i <= N; i++) {
       const t = i / N;
@@ -847,6 +906,8 @@ function bindRange(id, get, set, label, scale = 100) {
 }
 const bp = () => brushParams();
 const refreshers = [
+  bindRange('stabilizer', () => bp().stabilizer || 0, v => { bp().stabilizer = v; },
+            v => v > 0 ? Math.round(v * STABILIZER_MAX_PX) + ' px' : 'Off'),
   bindRange('streamline', () => bp().streamline, v => { bp().streamline = v; }, pct),
   bindRange('smoothing', () => bp().smoothing, v => { bp().smoothing = v; }, pct),
   bindRange('opacity', () => bp().opacity, v => { bp().opacity = Math.max(0.05, v); }, pct),

@@ -88,6 +88,11 @@
         <div id="brushChips" class="brush-chips" role="radiogroup" aria-label="Brush"></div>
         <h3 id="brushSectionTitle">Brush</h3>
         <label class="row">
+          <span class="name">Stabilizer <small>ink trails the pen on a string — slower, steadier lines</small></span>
+          <input type="range" id="stabilizer" min="0" max="100" step="1" />
+          <output id="stabilizerVal"></output>
+        </label>
+        <label class="row">
           <span class="name">StreamLine <small>pulls the line behind the nib</small></span>
           <input type="range" id="streamline" min="0" max="100" step="1" />
           <output id="streamlineVal"></output>
