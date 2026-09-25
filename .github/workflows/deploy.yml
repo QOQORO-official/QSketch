@@ -47,6 +47,9 @@ jobs:
           # Jekyll would otherwise ignore files it doesn't understand.
           touch _site/.nojekyll
 
+      - name: Stamp the build version
+        run: bash tools/stamp.sh _site "${GITHUB_SHA::8}"
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site

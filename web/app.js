@@ -15,7 +15,30 @@
  */
 'use strict';
 
-const WASM_URL = 'qsketch.wasm';
+// Build version, stamped by tools/stamp.sh at deploy time ('dev' locally).
+// The same value goes into index.html (<meta name="qsketch-version">) and
+// into every asset URL (?v=...), so a deploy never mixes old and new files.
+const APP_VERSION = 'dev';
+
+// GitHub Pages lets browsers cache each file for 10 minutes, independently.
+// A phone can therefore run this script inside a stale index.html from the
+// previous deploy. Detect that before touching the DOM and reload once with
+// a fresh copy of the page.
+(function healStaleCache() {
+  if (APP_VERSION === 'dev') return;
+  const meta = document.querySelector('meta[name="qsketch-version"]');
+  if (meta && meta.content === APP_VERSION) return;
+  let tried = null;
+  try { tried = sessionStorage.getItem('qsketch.heal'); } catch (_) {}
+  if (tried === APP_VERSION) return;          // already tried once: don't loop
+  try { sessionStorage.setItem('qsketch.heal', APP_VERSION); } catch (_) {}
+  fetch(location.pathname, { cache: 'reload' })
+    .catch(() => {})
+    .then(() => location.reload());
+  throw new Error('QSketch: page files from two versions were cached; reloading');
+})();
+
+const WASM_URL = 'qsketch.wasm' + (APP_VERSION === 'dev' ? '' : '?v=' + APP_VERSION);
 const SETTINGS_KEY = 'qsketch.brush.v2';
 const LEGACY_SETTINGS_KEY = 'qsketch.brush.v1';
 
@@ -603,13 +626,14 @@ function setSize(w) {
 
 // ---- brush picker ----
 const brushMenu = $('brushMenu');
-function selectBrush(id) {
+function selectBrush(id, { keepPanel = false } = {}) {
   if (!BRUSHES.some(b => b.id === id)) return;
   settings.brush = id;
   saveSettings();
   selectTool('pen');
   syncBrushUI();
   closeBrushMenu();
+  if (!keepPanel) closePanel();
 }
 function syncBrushUI() {
   const def = brushDef();
@@ -619,6 +643,8 @@ function syncBrushUI() {
   document.querySelectorAll('.nib-only').forEach(el => { el.hidden = def.kind !== TIP_NIB; });
   document.querySelectorAll('.brush-item').forEach(el =>
     el.setAttribute('aria-pressed', String(el.dataset.brush === def.id)));
+  document.querySelectorAll('.brush-chip').forEach(el =>
+    el.setAttribute('aria-checked', String(el.dataset.brush === def.id)));
   refreshers.forEach(f => f());
   showSize();
   drawCurve();
@@ -633,6 +659,14 @@ function buildBrushMenu() {
                      `<canvas class="bi-preview" aria-hidden="true"></canvas>`;
     item.addEventListener('click', () => selectBrush(b.id));
     list.appendChild(item);
+    // the same choice at the top of the Brush settings panel
+    const chip = document.createElement('button');
+    chip.className = 'brush-chip';
+    chip.dataset.brush = b.id;
+    chip.setAttribute('role', 'radio');
+    chip.innerHTML = `<span class="ci">${b.icon}</span><span>${b.name}</span>`;
+    chip.addEventListener('click', () => selectBrush(b.id, { keepPanel: true }));
+    $('brushChips').appendChild(chip);
   }
 }
 function openBrushMenu() {
@@ -970,6 +1004,37 @@ function hideHint() {
 // -------------------------------------------------------------------------
 // boot the wasm engine
 // -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// new deploys: tell the user instead of silently running old code
+// -------------------------------------------------------------------------
+let updateShown = false;
+async function checkForUpdate() {
+  if (APP_VERSION === 'dev' || updateShown) return;
+  try {
+    const r = await fetch('version.json', { cache: 'no-store' });
+    if (!r.ok) return;
+    const { version } = await r.json();
+    if (version && version !== APP_VERSION) showUpdate();
+  } catch (_) { /* offline: try again later */ }
+}
+function showUpdate() {
+  updateShown = true;
+  $('updateBar').hidden = false;
+}
+function watchForUpdates() {
+  if (APP_VERSION === 'dev') return;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') checkForUpdate();
+  });
+  setInterval(checkForUpdate, 10 * 60 * 1000);
+}
+$('updateReload').addEventListener('click', () => {
+  // A reload clears the canvas: offer to keep the drawing first.
+  if (E && E.qs_can_undo() && !confirm('Reloading clears the current drawing. Reload now? (Cancel to Save it first.)')) return;
+  fetch(location.pathname, { cache: 'reload' }).catch(() => {}).then(() => location.reload());
+});
+$('updateLater').addEventListener('click', () => { $('updateBar').hidden = true; });
+
 async function boot() {
   const resp = await fetch(WASM_URL);
   if (!resp.ok) throw new Error('HTTP ' + resp.status + ' fetching ' + WASM_URL);
@@ -1004,6 +1069,7 @@ async function boot() {
   $('loading').classList.add('hidden');
   requestAnimationFrame(frame);
   hintTimer = setTimeout(hideHint, 8000);
+  watchForUpdates();
 }
 
 boot().catch(err => {

@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <meta name="theme-color" content="#1b1d23" />
+<meta name="qsketch-version" content="dev" />
 <title>QSketch — Nim · WebAssembly sketchpad</title>
 <meta name="description" content="A fast, infinite-canvas sketch & handwritten-notes app. Pressure-sensitive vector strokes, powered by a Nim engine compiled to WebAssembly. Inspired by Rnote." />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%236c8cff'/%3E%3Cpath d='M7 22 L20 9 l3 3 L10 25 l-4 1 z' fill='%23fff'/%3E%3C/svg%3E" />
@@ -65,6 +66,11 @@
       Draw with a pen or mouse · <b>Scroll</b> to zoom · <b>Space + drag</b> or middle-drag to pan
     </div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="updateBar" class="update-bar" role="status" hidden>
+      <span>A new version of QSketch is available.</span>
+      <button id="updateReload" class="primary">Reload</button>
+      <button id="updateLater" class="icon" aria-label="Dismiss">✕</button>
+    </div>
 
     <!-- Brush picker -->
     <section id="brushMenu" class="panel menu" role="dialog" aria-label="Brushes" hidden>
@@ -79,6 +85,7 @@
       </header>
 
       <div class="panel-body">
+        <div id="brushChips" class="brush-chips" role="radiogroup" aria-label="Brush"></div>
         <h3 id="brushSectionTitle">Brush</h3>
         <label class="row">
           <span class="name">StreamLine <small>pulls the line behind the nib</small></span>
