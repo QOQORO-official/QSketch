@@ -48,3 +48,19 @@ func pad*(b: Aabb, m: float32): Aabb {.inline.} =
 
 func contains*(b: Aabb, p: Vec2): bool {.inline.} =
   p.x >= b.minx and p.x <= b.maxx and p.y >= b.miny and p.y <= b.maxy
+
+## Even-odd point-in-polygon test (poly given as a closed ring of points).
+func insidePoly*(poly: openArray[Vec2], p: Vec2): bool =
+  var inside = false
+  var j = poly.len - 1
+  for i in 0 ..< poly.len:
+    let a = poly[i]
+    let b = poly[j]
+    if (a.y > p.y) != (b.y > p.y):
+      let x = a.x + (p.y - a.y) * (b.x - a.x) / (b.y - a.y)
+      if p.x < x: inside = not inside
+    j = i
+  inside
+
+func overlaps*(a, b: Aabb): bool {.inline.} =
+  a.minx <= b.maxx and b.minx <= a.maxx and a.miny <= b.maxy and b.miny <= a.maxy

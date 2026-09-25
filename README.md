@@ -63,9 +63,20 @@ here reduced to a single command-line pipeline instead of an in-browser IDE.
   ignores touches while the pen is down. The **S Pen side button erases**.
 - **Infinite canvas**: pan and zoom are a pure Canvas2D transform. Committed
   strokes are cached in a layer, so only the live stroke redraws while you draw.
-- **Tools**: pen, stroke eraser with its own size (one drag = one undo step), pan.
-- **Undo / redo**, **Save / open** (`.qsketch` stores each stroke's tip and
-  brush settings; older files still open), **Export PNG**.
+- **Lasso** (like GoodNotes): loop around ink to select it; strokes count as
+  selected when most of them is inside the loop. Drag inside the box to move,
+  pull the corner handle to resize, swing the top handle to rotate (snaps to
+  15°). Delete, Duplicate, or tap a colour to recolour; each edit is one undo
+  step. A rotated calligraphy stroke turns its nib with it, so it looks
+  identical, just rotated.
+- **Page styles** (📄): Blank, Dots, Grid, Lines, or Notebook (ruled lines + red
+  margin), with adjustable spacing and paper (match theme, white, cream, grey,
+  dark). The pattern is anchored to the page, so writing sits on the lines as
+  you zoom and pan. The style is saved in the `.qsketch` file and used for PNG
+  export.
+- **Tools**: pen, stroke eraser with its own size (one drag = one undo step), lasso, pan.
+- **Undo / redo**, **Save / open** (`.qsketch` stores each stroke's tip, brush
+  settings and the page style; older files still open), **Export PNG**.
 - **No runtime dependencies**: one HTML file, one JS file, one CSS file and one
   self-contained `.wasm` with zero imports. Light/dark aware; settings are
   remembered per browser.
@@ -99,7 +110,7 @@ Source layout:
 | `src/qsketch.nim` | WASM entry points / ABI |
 | `src/engine/geometry.nim` | vec2 / AABB maths |
 | `src/engine/stroke.nim` | StreamLine + smoothing, tip sweep → one outline per stroke (round tip, calligraphy nib) |
-| `src/engine/document.nim` | stroke store, undo/redo, binary (de)serialize |
+| `src/engine/document.nim` | stroke store, undo/redo, lasso selection & transforms, page style, binary (de)serialize |
 | `web/` | the static site (`index.html`, `app.js`, `styles.css`, built `qsketch.wasm`) |
 | `build/walloc.c`, `build/inc/` | freestanding libc shim + stub headers |
 | `tools/build.sh` | the Nim → C → wasm build pipeline |
@@ -141,7 +152,8 @@ No secrets or servers required — it's a fully static build.
 | Pen / mouse | Draw | S Pen side button | Erase while held |
 | Pinch | Zoom | Two-finger drag | Pan |
 | 2-finger tap | Undo | 3-finger tap | Redo |
-| `P` / `E` / `H` | Pen / Eraser / Pan | hold `Space` | Pan |
+| `P` / `E` / `L` / `H` | Pen / Eraser / Lasso / Pan | hold `Space` | Pan |
+| `Delete` | Delete selection | `Ctrl/⌘ D` | Duplicate selection |
 | `[` / `]` | Size − / + | `B` | Brush settings |
 | `1`–`4` | Ballpoint / Fountain / Calligraphy / Marker | tap pen again | Brush picker |
 | `Ctrl/⌘ Z` | Undo | `Ctrl/⌘ Shift Z`, `Ctrl Y` | Redo |

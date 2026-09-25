@@ -452,3 +452,18 @@ proc hit*(s: Stroke, p: Vec2, radius: float32): bool =
     let proj = a + ab * t
     if (p - proj).lenSq <= r2: return true
   false
+
+## A copy of `s` scaled by `sc` and rotated by (cosA, sinA) about `pivot`,
+## then moved by `t`. Width scales with it and a calligraphy nib turns with
+## it, so the result looks exactly like the original, transformed.
+proc transformed*(s: Stroke, sc, cosA, sinA: float32, t, pivot: Vec2): Stroke =
+  result = s
+  result.alive = true
+  for i in 0 ..< result.raw.len:
+    let p = s.raw[i].pos - pivot
+    result.raw[i].pos = vec2(sc * (cosA * p.x - sinA * p.y),
+                             sc * (sinA * p.x + cosA * p.y)) + pivot + t
+  result.baseWidth = s.baseWidth * sc
+  result.nibDir = vec2(cosA * s.nibDir.x - sinA * s.nibDir.y,
+                       sinA * s.nibDir.x + cosA * s.nibDir.y).normalized
+  result.retessellate()

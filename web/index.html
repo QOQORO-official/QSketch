@@ -23,6 +23,7 @@
     <div class="group tools" role="toolbar" aria-label="Tools">
       <button class="tool" id="penTool" data-tool="pen" title="Pen (P) · tap again for brushes (1–4)" aria-pressed="true" aria-haspopup="dialog" aria-expanded="false" aria-controls="brushMenu"><i id="penIcon" class="ticon">✒️</i><span id="penName">Fountain pen</span><b class="caret" aria-hidden="true">▾</b></button>
       <button class="tool" data-tool="eraser" title="Eraser (E)" aria-pressed="false">🩹<span>Eraser</span></button>
+      <button class="tool" data-tool="lasso"  title="Lasso: circle ink to select, move, resize, rotate (L)" aria-pressed="false"><svg class="ticon-svg" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4c5 0 8.5 2.6 8.5 6s-3.5 6-8.5 6c-1.4 0-2.7-.2-3.9-.6" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="3 2.6" stroke-linecap="round"/><path d="M8.1 15.4C5.1 14.4 3.5 12.4 3.5 10 3.5 6.6 7 4 12 4" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="3 2.6" stroke-linecap="round"/><path d="M8 15.5c-.6 1.6-.2 3.2 1.2 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><span>Lasso</span></button>
       <button class="tool" data-tool="pan"    title="Pan (H / hold Space)" aria-pressed="false">✋<span>Pan</span></button>
     </div>
 
@@ -51,6 +52,7 @@
       <button id="saveBtn"   title="Save .qsketch">Save</button>
       <button id="openBtn"   title="Open .qsketch">Open</button>
       <button id="pngBtn"    title="Export PNG">PNG</button>
+      <button id="pageBtn"   title="Page style: dots, grid, lines, paper" aria-haspopup="dialog" aria-expanded="false" aria-controls="pagePanel">📄</button>
       <input type="file" id="fileInput" accept=".qsketch,application/octet-stream" hidden />
     </div>
   </header>
@@ -71,6 +73,33 @@
       <button id="updateReload" class="primary">Reload</button>
       <button id="updateLater" class="icon" aria-label="Dismiss">✕</button>
     </div>
+
+    <!-- Lasso selection actions -->
+    <div id="selBar" class="sel-bar" role="toolbar" aria-label="Selection" hidden>
+      <button id="selDelete" title="Delete (Del)">🗑<span>Delete</span></button>
+      <button id="selDuplicate" title="Duplicate (Ctrl+D)">⧉<span>Duplicate</span></button>
+      <button id="selDone" title="Done (Esc)">✓<span>Done</span></button>
+    </div>
+
+    <!-- Page style -->
+    <section id="pagePanel" class="panel" role="dialog" aria-label="Page style" hidden>
+      <header class="panel-head">
+        <h2>Page</h2>
+        <button id="pageClose" class="icon" title="Close" aria-label="Close">✕</button>
+      </header>
+      <div class="panel-body">
+        <h3>Pattern</h3>
+        <div id="patternChips" class="pattern-chips" role="radiogroup" aria-label="Pattern"></div>
+        <label class="row">
+          <span class="name">Spacing <small>distance between dots or lines</small></span>
+          <input type="range" id="pageSpacing" min="12" max="72" step="2" />
+          <output id="pageSpacingVal"></output>
+        </label>
+        <h3>Paper</h3>
+        <div id="paperChips" class="paper-chips" role="radiogroup" aria-label="Paper colour"></div>
+        <p class="note">Saved with your drawing, and used for PNG export.</p>
+      </div>
+    </section>
 
     <!-- Brush picker -->
     <section id="brushMenu" class="panel menu" role="dialog" aria-label="Brushes" hidden>

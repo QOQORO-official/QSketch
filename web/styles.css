@@ -236,3 +236,30 @@ button.icon { padding: 4px 9px; border-radius: 8px; }
 }
 .update-bar[hidden] { display: none; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* ---------- lasso ---------- */
+.ticon-svg { width: 18px; height: 18px; flex: none; }
+.sel-bar {
+  position: absolute; z-index: 7; display: flex; gap: 4px; padding: 4px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow);
+}
+.sel-bar[hidden] { display: none; }
+.sel-bar button { padding: 6px 10px; font-size: 13px; }
+@media (max-width: 600px) { .sel-bar button span { display: none; } }
+
+/* ---------- page panel ---------- */
+.pattern-chips { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin: 4px 0 6px; }
+.pattern-chip {
+  flex-direction: column; gap: 4px; padding: 6px 4px; font-size: 11px; justify-content: center;
+}
+.pattern-chip canvas {
+  width: 100%; height: 40px; display: block; border-radius: 6px; border: 1px solid var(--border);
+}
+.pattern-chip[aria-checked="true"] { border-color: var(--accent); background: var(--accent-weak); }
+.paper-chips { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin: 4px 0; }
+.paper-chip { flex-direction: column; gap: 4px; padding: 6px 2px; font-size: 11px; justify-content: center; }
+.paper-chip i {
+  width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--border); display: block;
+}
+.paper-chip[aria-checked="true"] { border-color: var(--accent); background: var(--accent-weak); }
+#pageBtn[aria-expanded="true"] { background: var(--accent-weak); border-color: var(--accent); }

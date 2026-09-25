@@ -135,6 +135,59 @@ proc qs_can_redo(): int32 {.wexport.} =
   if doc.canRedo(): 1 else: 0
 
 # --------------------------------------------------------------------------
+# Lasso selection. The lasso polygon is passed as x0,y0,x1,y1,... (world).
+# --------------------------------------------------------------------------
+var selBounds: array[4, float32]
+
+proc qs_lasso(p: ptr UncheckedArray[float32], nfloats: int32): int32 {.wexport.} =
+  var poly: seq[Vec2]
+  var i = 0
+  while i + 1 < int(nfloats):
+    poly.add vec2(p[i], p[i + 1])
+    i += 2
+  int32(doc.lassoSelect(poly))
+
+proc qs_select_clear() {.wexport.} = doc.clearSelection()
+proc qs_selection_count(): int32 {.wexport.} = int32(doc.selection.len)
+
+proc qs_selection_id(i: int32): int32 {.wexport.} =
+  if i < 0 or int(i) >= doc.selection.len: return -1
+  int32(doc.selection[int(i)])
+
+proc qs_selection_bounds(): pointer {.wexport.} =
+  ## -> 4 floats: minx, miny, maxx, maxy (tight ink bounds, world units)
+  let b = doc.selectionBounds()
+  selBounds = [b.minx, b.miny, b.maxx, b.maxy]
+  addr selBounds[0]
+
+proc qs_selection_transform(sc, cosA, sinA, tx, ty, px, py: float32): int32 {.wexport.} =
+  ## Scale by sc and rotate by (cosA, sinA) about (px, py), then move by
+  ## (tx, ty). One undo step; the result stays selected.
+  int32(doc.transformSelection(sc, cosA, sinA, vec2(tx, ty), vec2(px, py)))
+
+proc qs_selection_recolor(color: uint32): int32 {.wexport.} =
+  int32(doc.recolorSelection(color))
+
+proc qs_selection_delete(): int32 {.wexport.} =
+  int32(doc.deleteSelection())
+
+proc qs_selection_duplicate(dx, dy: float32): int32 {.wexport.} =
+  int32(doc.duplicateSelection(vec2(dx, dy)))
+
+# --------------------------------------------------------------------------
+# Page style (stored with the drawing; the UI renders it).
+# --------------------------------------------------------------------------
+proc qs_set_page(pattern: int32, spacing: float32, paper: uint32) {.wexport.} =
+  doc.pagePattern = if pattern >= 0 and pattern <= int32(ord(high(PagePattern))): PagePattern(pattern) else: ppDots
+  doc.pageSpacing = if spacing > 1'f32: spacing else: 24'f32
+  doc.pagePaper = paper
+
+proc qs_page_pattern(): int32 {.wexport.} = int32(ord(doc.pagePattern))
+proc qs_page_spacing(): float32 {.wexport.} = doc.pageSpacing
+proc qs_page_paper(): uint32 {.wexport.} = doc.pagePaper
+proc qs_page_loaded(): int32 {.wexport.} = (if doc.pageLoaded: 1 else: 0)
+
+# --------------------------------------------------------------------------
 # Serialization. save -> scratch buffer; JS reads (ptr,len) then may download.
 # --------------------------------------------------------------------------
 

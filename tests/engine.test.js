@@ -308,6 +308,114 @@ function hand(pace, { smoothing = 0, streamline = 0, rope = 0, amp = 1.5 } = {})
   check('missing string length means "off", not frozen ink', b.maxx - b.minx > 100);
 }
 
+// ------------------------------------------------------ lasso selection
+function lasso(e, pts) {
+  const p = e.qs_alloc(pts.length * 8);
+  const f = new Float32Array(e.memory.buffer, p, pts.length * 2);
+  pts.forEach(([x, y], i) => { f[2 * i] = x; f[2 * i + 1] = y; });
+  return e.qs_lasso(p, pts.length * 2);
+}
+const ring = (cx, cy, r, n = 40) => Array.from({ length: n }, (_, i) => [cx + r * Math.cos(i / n * 2 * Math.PI), cy + r * Math.sin(i / n * 2 * Math.PI)]);
+const outlineOf = (e, id) => Array.from(new Float32Array(e.memory.buffer, e.qs_stroke_outline_ptr(id), e.qs_stroke_outline_count(id)));
+const alive = (e) => Array.from({ length: e.qs_stroke_count() }, (_, i) => e.qs_stroke_alive(i)).join('');
+const selIds = (e) => Array.from({ length: e.qs_selection_count() }, (_, i) => e.qs_selection_id(i));
+function threeStrokes(e) {
+  draw(e, [[0, 0], [40, 0]], { width: 6 });                           // A: fully inside the loop
+  draw(e, [[0, 30], [40, 30]], { width: 6 });                         // B: fully inside the loop
+  draw(e, [[45, 60], [150, 60]], { width: 6 });                       // C: only its tip is inside
+}
+{
+  const e = boot(); threeStrokes(e);
+  const n = lasso(e, ring(20, 20, 45));
+  check('lasso selects what is mostly inside, not what it grazes', n === 2 && selIds(e).join() === '0,1', `selected ${selIds(e).join()}`);
+  const b = new Float32Array(e.memory.buffer, e.qs_selection_bounds(), 4);
+  check('selection bounds are the tight ink bounds', Math.abs(b[0] + 3) < 0.05 && Math.abs(b[1] + 3) < 0.05 && Math.abs(b[2] - 43) < 0.05 && Math.abs(b[3] - 33) < 0.05,
+        Array.from(b).map(v => v.toFixed(2)).join(', '));
+  check('an empty loop selects nothing', lasso(e, ring(500, 500, 10)) === 0 && e.qs_selection_count() === 0);
+}
+{ // move: exact translation, one undo step, the moved copy stays selected
+  const e = boot(); threeStrokes(e);
+  lasso(e, ring(20, 20, 45));
+  const before = [outlineOf(e, 0), outlineOf(e, 1)];
+  e.qs_selection_transform(1, 1, 0, 10, 5, 0, 0);
+  const ids = selIds(e);
+  let maxErr = 0;
+  ids.map(id => outlineOf(e, id)).forEach((o, k) => {
+    const a = before[k];
+    if (o.length !== a.length) { maxErr = Infinity; return; }
+    for (let i = 0; i < a.length;) { const n = a[i]; if (o[i] !== n) maxErr = Infinity; i++;
+      for (let j = 0; j < n; j++, i += 2) maxErr = Math.max(maxErr, Math.abs(o[i] - a[i] - 10), Math.abs(o[i + 1] - a[i + 1] - 5)); }
+  });
+  check('move shifts the ink exactly', maxErr < 1e-3, `max error ${maxErr.toExponential(1)}`);
+  check('the moved copy stays selected, originals hidden', ids.join() === '3,4' && alive(e) === '00111', `alive ${alive(e)}`);
+  e.qs_undo();
+  check('one undo puts it back', alive(e) === '11100' && e.qs_selection_count() === 0, `alive ${alive(e)}`);
+  e.qs_redo();
+  check('redo moves it again', alive(e) === '00111');
+}
+{ // resize: positions and width scale together about the pivot
+  const e = boot();
+  draw(e, [[10, 10], [50, 10]], { width: 4 });
+  lasso(e, ring(30, 10, 40));
+  e.qs_selection_transform(2, 1, 0, 0, 0, 10, 10);
+  const b = bounds(polys(e, selIds(e)[0]));
+  check('resize scales length and thickness together', Math.abs(b.maxx - b.minx - 88) < 0.1 && Math.abs(b.maxy - b.miny - 8) < 0.1,
+        `${(b.maxx - b.minx).toFixed(2)} x ${(b.maxy - b.miny).toFixed(2)} (was 44 x 4)`);
+}
+{ // rotate a calligraphy stroke 90°: identical to the original, turned (the nib turns too)
+  const e = boot();
+  const pts = Array.from({ length: 12 }, (_, i) => [i * 6, Math.sin(i / 2) * 10]);
+  draw(e, pts, { width: 16, kind: NIB });
+  lasso(e, ring(30, 0, 80));
+  e.qs_selection_transform(1, 0, 1, 0, 0, 0, 0);                    // cos 0, sin 1 = +90°
+  const rot = polys(e, selIds(e)[0])[0];
+  const orig = polys(e, 0)[0].map(([x, y]) => [-y, x]);              // original, rotated by hand
+  const near = (P, Q) => P.every(([x, y]) => Q.some(([u, v]) => Math.hypot(x - u, y - v) < 0.05));
+  check('rotation turns the nib with the stroke (looks identical, rotated)', near(rot, orig) && near(orig, rot), `${rot.length} vs ${orig.length} points`);
+}
+{ // delete, duplicate, recolor
+  const e = boot(); threeStrokes(e);
+  lasso(e, ring(20, 20, 45));
+  check('delete hides the selection', e.qs_selection_delete() === 2 && alive(e) === '001' && e.qs_selection_count() === 0);
+  e.qs_undo();
+  check('undo restores deleted ink', alive(e) === '111');
+  lasso(e, ring(20, 20, 45));
+  e.qs_selection_duplicate(100, 0);
+  const copies = selIds(e);
+  const b = bounds(polys(e, copies[0]));
+  check('duplicate adds offset copies and selects them', copies.join() === '3,4' && alive(e) === '11111' && Math.abs(b.minx - 97) < 0.05,
+        `copies ${copies.join()}, first at x=${b.minx.toFixed(2)}`);
+  e.qs_undo();
+  check('one undo removes the copies', alive(e) === '11100');
+  lasso(e, ring(20, 20, 45));
+  e.qs_selection_recolor(0xff0000ff);
+  const ids = selIds(e);
+  check('recolor replaces the colour (undoable)', ids.every(id => e.qs_stroke_color(id) >>> 0 === 0xff0000ff) && e.qs_stroke_color(0) >>> 0 === 0xff, ids.join());
+  e.qs_undo();
+  check('undo restores the colour', alive(e).startsWith('111') && e.qs_stroke_color(0) >>> 0 === 0xff && e.qs_stroke_alive(ids[0]) === 0);
+  draw(e, [[0, 90], [40, 90]], { width: 6, color: 0x11223380 });     // translucent marker ink
+  lasso(e, ring(20, 90, 30));
+  e.qs_selection_recolor(0x00ff00ff);
+  check('recolor keeps each stroke\'s own opacity', (e.qs_stroke_color(selIds(e)[0]) >>> 0) === 0x00ff0080);
+}
+{ // bad transforms are ignored
+  const e = boot(); threeStrokes(e); lasso(e, ring(20, 20, 45));
+  check('zero / NaN scale is refused', e.qs_selection_transform(0, 1, 0, 0, 0, 0, 0) === 0 && e.qs_selection_transform(NaN, 1, 0, 0, 0, 0, 0) === 0 && alive(e) === '111');
+}
+
+// ------------------------------------------------------ page style
+{
+  const e = boot();
+  e.qs_set_page(4, 32, 0xfff6dcff);                                   // notebook, 32, cream
+  draw(e, [[0, 0], [30, 0]]);
+  const sp = e.qs_save_ptr(), n = e.qs_save_len();
+  const bytes = new Uint8Array(e.memory.buffer, sp, n).slice();
+  const e2 = boot();
+  const p = e2.qs_alloc(bytes.length); new Uint8Array(e2.memory.buffer, p, bytes.length).set(bytes);
+  check('page style travels with the file', e2.qs_load(p, bytes.length) === 1 && e2.qs_page_loaded() === 1 &&
+        e2.qs_page_pattern() === 4 && e2.qs_page_spacing() === 32 && (e2.qs_page_paper() >>> 0) === 0xfff6dcff && e2.qs_stroke_count() === 1);
+}
+
 // ------------------------------------------------------ live stroke API
 {
   const e = boot();
@@ -341,10 +449,10 @@ const outline = (e, id) => Array.from(new Float32Array(e.memory.buffer, e.qs_str
   e.qs_commit_stroke();
   const before = [outline(e, 0), outline(e, 1)];
   const bytes = saveBytes(e);
-  check('save header QSK3', String.fromCharCode(...bytes.slice(0, 4)) === 'QSK3');
+  check('save header QSK4', String.fromCharCode(...bytes.slice(0, 4)) === 'QSK4');
 
   const e2 = boot();
-  check('load QSK3', load(e2, bytes) === 1 && e2.qs_stroke_count() === 2);
+  check('load QSK4', load(e2, bytes) === 1 && e2.qs_stroke_count() === 2);
   const same = (a, b) => a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) < 1e-4);
   check('round stroke reloads identically', same(before[0], outline(e2, 0)));
   check('calligraphy stroke reloads identically (tip kept)', same(before[1], outline(e2, 1)));
@@ -369,7 +477,7 @@ const outline = (e, id) => Array.from(new Float32Array(e.memory.buffer, e.qs_str
   dv.setFloat32(16, 0.3, true); dv.setFloat32(20, 0.2, true); dv.setUint32(24, 2, true);
   [[0, 0, .5], [30, 10, .8]].forEach((v, i) => v.forEach((f, j) => dv.setFloat32(28 + i * 12 + j * 4, f, true)));
   const e = boot();
-  check('legacy QSK2 loads', load(e, new Uint8Array(dv.buffer)) === 1 && e.qs_stroke_count() === 1 && e.qs_stroke_outline_count(0) > 0);
+  check('legacy QSK2 loads (keeping the current page style)', load(e, new Uint8Array(dv.buffer)) === 1 && e.qs_stroke_count() === 1 && e.qs_stroke_outline_count(0) > 0 && e.qs_page_loaded() === 0);
 }
 
 console.log(ok ? '\nALL ENGINE TESTS PASS' : '\nSOME TESTS FAILED');
